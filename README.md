@@ -150,7 +150,46 @@ _Motivated by:_
 
 ---
 
+### Usage-limit windows (ChatGPT / Codex subscriptions)
+
+OpenAI subscription plans do not fail with a transport error when the quota is gone: the request is rejected with `The usage limit has been reached` and retrying is pointless until the 5-hour or 7-day window resets. Blind `continue` attempts only burn the retry budget and reproduce the same error.
+
+For models served by the `openai` provider (configurable via `usageLimitProviders`), the plugin queries the ChatGPT usage endpoint (`GET https://chatgpt.com/backend-api/wham/usage`, read-only, no quota consumed) with the credentials from `~/.codex/auth.json` and schedules a single resume at **window reset + `usageLimitGraceMs`** (default 60s).
+
+While a wait is armed:
+- stall / idle / streaming-failure recovery for that session is suppressed;
+- no `continue` prompt is sent to the model;
+- the resume moment is re-verified through the same endpoint before the prompt goes out, so a stale or refreshed window never causes a wasted attempt;
+- ESC cancels the wait immediately.
+
+If the reset moment cannot be determined (expired token, endpoint change, network failure), the plugin rechecks every `usageLimitRecheckMs` instead of touching the model, up to `usageLimitMaxRechecks` times.
+
+Other providers are never affected: the limit signature is only acted on for providers listed in `usageLimitProviders`.
+
+#### Checking the limit by hand
+
+```bash
+node dist/codex-limits-cli.js          # human-readable
+node dist/codex-limits-cli.js --json   # machine-readable
+bunx codex-limits --model gpt-6.1-sol  # via the package bin
+```
+
+```
+plan:    plus
+status:  LIMIT REACHED (primary 5h 100%, secondary 7d 16%)
+reset:   2026-10-29 18:25:08 [primary]
+resume:  2026-10-29 18:26:08 (+60s, in 4h)
+credits: 1 manual reset(s) available
+```
+
+Exit codes: `0` limits available, `3` limit reached with a known reset, `4` limit reached with an unknown reset, `1` auth/network/format failure.
+
+The same code path is used by the plugin; `usageLimitScript` points the plugin at an external command instead (it must accept `--json` and print the same payload as the CLI).
+
+---
+
 ### Silent dead-stream recovery
+
 
 The model stream can die after emitting only reasoning — no text part, no tool call — finalizing with `finish: "unknown"`. OpenCode treats the message as completed and the session goes idle, so no error or stall path triggers. On idle, if the **newest** assistant message has a finish reason, zero text parts, and at least `silentDeadStreamMinTokens` output tokens, the plugin sends a recovery prompt. Only the newest assistant message is evaluated — a delivered text answer means normal completion, and older tool-call steps are never misread as dead streams. Recovery is also skipped if the session has gone busy/retry again before the prompt is sent (race guard).
 
@@ -382,6 +421,15 @@ With options:
 | `doneWithoutDetailsPrompt` | `DONE_WITHOUT_DETAILS_PROMPT` | Override the done-claim-with-no-todos report prompt |
 | `silentDeadStreamMinTokens` | `200` | Min output tokens to treat a textless `finish:"unknown"` message as a dead stream |
 | `busyStallStrategy` | `"continue"` | Busy-stall response: `"continue"`, `"abort"` (abort-first), or `"off"` (disabled) |
+| `usageLimitEnabled` | `true` | Turn the usage-limit wait on/off |
+| `usageLimitProviders` | `["openai"]` | Providers whose usage-limit errors are handled by scheduling a reset-aware resume |
+| `usageLimitMessagePatterns` | ChatGPT limit phrases | Regex/substring patterns identifying the usage-limit error text |
+| `usageLimitGraceMs` | `60000` | Extra wait after the window reset before resuming |
+| `usageLimitTimeoutMs` | `10000` | Timeout for the usage endpoint request |
+| `usageLimitRecheckMs` | `600000` | Recheck interval when the reset moment is unknown |
+| `usageLimitMaxRechecks` | `6` | Max rechecks before giving up on an unknown reset |
+| `usageLimitMaxWaitMs` | `691200000` | Upper bound for a single wait (8 days) |
+| `usageLimitScript` | `null` | External command used instead of the built-in client (must support `--json`) |
 
 Message patterns are matched case-insensitively. Error names use exact match.
 

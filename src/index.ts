@@ -6,6 +6,14 @@
 import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { SessionPromptResponses } from "@opencode-ai/sdk"
+import { execFile } from "node:child_process"
+import {
+    evaluateCodexLimits,
+    formatDuration,
+    formatLocalTime,
+    matchesUsageLimitMessage,
+    DEFAULT_USAGE_LIMIT_MESSAGE_PATTERNS,
+} from "./codex-limits"
 
 interface Todo {
     content: string
@@ -16,6 +24,32 @@ interface Todo {
 interface ToolCallRecord {
     toolName: string
     at: number
+}
+
+/**
+ * Armed wait for a ChatGPT/Codex subscription limit reset: while present, all
+ * other recovery paths are suppressed, because retrying before the window
+ * resets only burns attempts and reproduces the same error.
+ */
+export interface UsageLimitWait {
+    resumeAtMs: number
+    resetAtMs: number | null
+    decidingWindow: string | null
+    providerID: string | null
+    modelID: string | null
+    rechecks: number
+    timer: ReturnType<typeof setTimeout> | null
+}
+
+export interface UsageLimitProbe {
+    ok: boolean
+    limitReached: boolean
+    resetAtMs: number | null
+    resumeAtMs: number | null
+    decidingWindow: string | null
+    graceMs: number
+    reason?: string
+    message?: string
 }
 
 export interface SessionWatch {
@@ -54,6 +88,7 @@ export interface SessionWatch {
     pendingRecoveryAt: number
     recoveryAttempts: number
     watchdogRetryGuard: boolean
+    usageLimit: UsageLimitWait | null
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -72,6 +107,14 @@ const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
 const DEFAULT_WARMUP_MS = 15_000
 const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
 const DEFAULT_DEBUG = false
+const DEFAULT_USAGE_LIMIT_ENABLED = true
+const DEFAULT_USAGE_LIMIT_PROVIDERS = ["openai"]
+const DEFAULT_USAGE_LIMIT_GRACE_MS = 60_000
+const DEFAULT_USAGE_LIMIT_TIMEOUT_MS = 10_000
+const DEFAULT_USAGE_LIMIT_RECHECK_MS = 10 * 60_000
+const DEFAULT_USAGE_LIMIT_MAX_RECHECKS = 6
+const DEFAULT_USAGE_LIMIT_MAX_WAIT_MS = 8 * 24 * 60 * 60_000
+const MAX_TIMER_DELAY_MS = 2_147_000_000
 
 const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
     "ProviderError",
@@ -443,6 +486,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         rawBusyStallStrategy === "abort" || rawBusyStallStrategy === "off"
             ? rawBusyStallStrategy
             : "continue"
+    const usageLimitEnabled: boolean =
+        (options?.usageLimitEnabled as boolean) !== false && DEFAULT_USAGE_LIMIT_ENABLED
+    const rawUsageLimitProviders = options?.usageLimitProviders as string[] | undefined
+    const usageLimitProviders: string[] =
+        Array.isArray(rawUsageLimitProviders) && rawUsageLimitProviders.length > 0
+            ? rawUsageLimitProviders.map((p) => String(p).toLowerCase())
+            : DEFAULT_USAGE_LIMIT_PROVIDERS
+    const usageLimitMessagePatterns: string[] =
+        (options?.usageLimitMessagePatterns as string[]) ?? DEFAULT_USAGE_LIMIT_MESSAGE_PATTERNS
+    const usageLimitGraceMs: number =
+        (options?.usageLimitGraceMs as number) ?? DEFAULT_USAGE_LIMIT_GRACE_MS
+    const usageLimitTimeoutMs: number =
+        (options?.usageLimitTimeoutMs as number) ?? DEFAULT_USAGE_LIMIT_TIMEOUT_MS
+    const usageLimitRecheckMs: number =
+        (options?.usageLimitRecheckMs as number) ?? DEFAULT_USAGE_LIMIT_RECHECK_MS
+    const usageLimitMaxRechecks: number =
+        (options?.usageLimitMaxRechecks as number) ?? DEFAULT_USAGE_LIMIT_MAX_RECHECKS
+    const usageLimitMaxWaitMs: number =
+        (options?.usageLimitMaxWaitMs as number) ?? DEFAULT_USAGE_LIMIT_MAX_WAIT_MS
+    const usageLimitScript: string | null =
+        (options?.usageLimitScript as string) ?? null
+    const usageLimitProbeOption = options?.usageLimitProbe as
+        | ((modelID: string | null) => Promise<UsageLimitProbe>)
+        | undefined
     const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
 
     const sessions = new Map<string, SessionWatch>()
@@ -542,6 +609,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 pendingRecoveryAt: 0,
                 recoveryAttempts: 0,
                 watchdogRetryGuard: false,
+                usageLimit: null,
             }
             sessions.set(sid, w)
         }
@@ -648,6 +716,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
 
         for (const sid of toDelete) {
+            const watch = sessions.get(sid)
+            if (watch) clearUsageLimit(watch, sid, "session evicted")
             sessions.delete(sid)
         }
         if (toDelete.length > 0) {
@@ -1515,6 +1585,10 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         if (w.userCancelled || w.completionSignaled) return false
         if (w.aborting) return false
+        if (w.usageLimit) {
+            dbg(`Abort suppressed on ${short(sid)}: usage limit wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
+            return false
+        }
 
         const idleSec = Math.round((Date.now() - (w.orphanWatchStartAt ?? w.lastActivityAt)) / 1000)
         await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
@@ -1554,12 +1628,368 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     // -----------------------------------------------------------------------
+    // Usage limit (ChatGPT/Codex subscription windows)
+    // -----------------------------------------------------------------------
+
+    async function getSessionProviderModel(
+        sid: string,
+    ): Promise<{ providerID: string | null; modelID: string | null }> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                const info = msg.info as Record<string, unknown> | undefined
+                const rawModel =
+                    (msg.model as Record<string, unknown> | undefined) ??
+                    (info?.model as Record<string, unknown> | undefined)
+                if (
+                    rawModel &&
+                    typeof rawModel.providerID === "string" &&
+                    typeof rawModel.modelID === "string"
+                ) {
+                    return { providerID: rawModel.providerID, modelID: rawModel.modelID }
+                }
+                const providerID =
+                    (msg.providerID as string | undefined) ??
+                    (info?.providerID as string | undefined)
+                const modelID =
+                    (msg.modelID as string | undefined) ??
+                    (info?.modelID as string | undefined)
+                if (typeof providerID === "string" || typeof modelID === "string") {
+                    return { providerID: providerID ?? null, modelID: modelID ?? null }
+                }
+            }
+        } catch (e) {
+            dbg(`provider/model lookup on ${short(sid)} failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        return { providerID: null, modelID: null }
+    }
+
+    function isUsageLimitSignal(errorName: string, errorMessage: string): boolean {
+        if (!usageLimitEnabled) return false
+        if (matchesUsageLimitMessage(errorMessage, usageLimitMessagePatterns)) return true
+        const combined = `${errorName} ${errorMessage}`
+        return /\b429\b/.test(combined) && /limit/i.test(combined)
+    }
+
+    function probeUsageLimitsViaScript(
+        script: string,
+        modelID: string | null,
+    ): Promise<UsageLimitProbe> {
+        const args = ["--json"]
+        if (modelID) args.push("--model", modelID)
+        args.push("--grace", String(Math.round(usageLimitGraceMs / 1000)))
+        return new Promise((resolve) => {
+            execFile(
+                script,
+                args,
+                { timeout: usageLimitTimeoutMs + 5_000, maxBuffer: 1 << 20 },
+                (error, stdout) => {
+                    const fail = (reason: string, message: string): void => {
+                        resolve({
+                            ok: false,
+                            limitReached: false,
+                            resetAtMs: null,
+                            resumeAtMs: null,
+                            decidingWindow: null,
+                            graceMs: usageLimitGraceMs,
+                            reason,
+                            message,
+                        })
+                    }
+                    if (error) {
+                        fail("script-error", error.message)
+                        return
+                    }
+                    let parsed: Record<string, unknown>
+                    try {
+                        parsed = JSON.parse(String(stdout)) as Record<string, unknown>
+                    } catch (e) {
+                        fail("script-output", e instanceof Error ? e.message : String(e))
+                        return
+                    }
+                    if (parsed.ok === false) {
+                        fail(
+                            typeof parsed.reason === "string" ? parsed.reason : "script-error",
+                            typeof parsed.message === "string" ? parsed.message : "",
+                        )
+                        return
+                    }
+                    const secondsToMs = (value: unknown): number | null =>
+                        typeof value === "number" && Number.isFinite(value)
+                            ? Math.round(value * 1000)
+                            : null
+                    resolve({
+                        ok: true,
+                        limitReached: parsed.limit_reached === true,
+                        resetAtMs: secondsToMs(parsed.reset_at),
+                        resumeAtMs: secondsToMs(parsed.resume_at),
+                        decidingWindow:
+                            typeof parsed.deciding_window === "string"
+                                ? parsed.deciding_window
+                                : null,
+                        graceMs:
+                            typeof parsed.grace_seconds === "number"
+                                ? parsed.grace_seconds * 1000
+                                : usageLimitGraceMs,
+                    })
+                },
+            )
+        })
+    }
+
+    async function probeUsageLimits(modelID: string | null): Promise<UsageLimitProbe> {
+        if (usageLimitProbeOption) return await usageLimitProbeOption(modelID)
+        if (usageLimitScript) return await probeUsageLimitsViaScript(usageLimitScript, modelID)
+        const result = await evaluateCodexLimits({
+            modelId: modelID,
+            graceMs: usageLimitGraceMs,
+            timeoutMs: usageLimitTimeoutMs,
+        })
+        if (!result.ok) {
+            return {
+                ok: false,
+                limitReached: false,
+                resetAtMs: null,
+                resumeAtMs: null,
+                decidingWindow: null,
+                graceMs: usageLimitGraceMs,
+                reason: result.reason,
+                message: result.message,
+            }
+        }
+        return {
+            ok: true,
+            limitReached: result.limitReached,
+            resetAtMs: result.resetAtMs,
+            resumeAtMs: result.resumeAtMs,
+            decidingWindow: result.decidingWindow,
+            graceMs: result.graceMs,
+        }
+    }
+
+    function clearUsageLimit(w: SessionWatch, sid: string, reason: string): void {
+        if (!w.usageLimit) return
+        if (w.usageLimit.timer) clearTimeout(w.usageLimit.timer)
+        w.usageLimit = null
+        dbg(`Usage-limit wait cleared on ${short(sid)}: ${reason}`)
+    }
+
+    async function armUsageLimitResume(
+        sid: string,
+        w: SessionWatch,
+        resumeAtMs: number,
+        resetAtMs: number | null,
+        decidingWindow: string | null,
+        providerID: string | null,
+        modelID: string | null,
+        rechecks: number,
+    ): Promise<void> {
+        if (w.usageLimit?.timer) clearTimeout(w.usageLimit.timer)
+        const now = Date.now()
+        const cappedResumeAt = Math.min(
+            Math.max(resumeAtMs, now + 1_000),
+            now + usageLimitMaxWaitMs,
+        )
+        w.usageLimit = {
+            resumeAtMs: cappedResumeAt,
+            resetAtMs,
+            decidingWindow,
+            providerID,
+            modelID,
+            rechecks,
+            timer: null,
+        }
+        w.pendingRecovery = false
+        w.pendingRecoveryReason = null
+        w.pendingRecoveryAt = 0
+        w.recoveryAttempts = 0
+        w.gaveUp = false
+        w.lastRetryAt = now
+        const delay = Math.max(1_000, Math.min(cappedResumeAt - now, MAX_TIMER_DELAY_MS))
+        const timer = setTimeout(() => {
+            void onUsageLimitTimer(sid)
+        }, delay)
+        const unrefable = timer as unknown as { unref?: () => void }
+        if (typeof unrefable.unref === "function") unrefable.unref()
+        w.usageLimit.timer = timer
+        await log(
+            "info",
+            `Usage limit on ${short(sid)} (${providerID ?? "?"}/${modelID ?? "?"}): ` +
+                `resume scheduled at ${formatLocalTime(cappedResumeAt)} (in ${formatDuration(cappedResumeAt - now)})` +
+                (resetAtMs ? `, window reset ${formatLocalTime(resetAtMs)}` : "") +
+                (decidingWindow ? ` [${decidingWindow}]` : "") +
+                `, no retries until then`,
+        )
+    }
+
+    async function applyUsageLimitProbe(
+        sid: string,
+        w: SessionWatch,
+        probe: UsageLimitProbe,
+        providerID: string | null,
+        modelID: string | null,
+        rechecks: number,
+    ): Promise<boolean> {
+        const now = Date.now()
+        if (!probe.ok) {
+            if (rechecks >= usageLimitMaxRechecks) {
+                await log(
+                    "warn",
+                    `Usage limit on ${short(sid)}: cannot determine reset (${probe.reason}: ${probe.message}); giving up after ${rechecks} rechecks`,
+                )
+                clearUsageLimit(w, sid, "rechecks exhausted")
+                return true
+            }
+            const nextCheck = now + usageLimitRecheckMs
+            await armUsageLimitResume(
+                sid,
+                w,
+                nextCheck,
+                null,
+                null,
+                providerID,
+                modelID,
+                rechecks + 1,
+            )
+            await log(
+                "warn",
+                `Usage limit on ${short(sid)}: reset unknown (${probe.reason}: ${probe.message}); ` +
+                    `recheck at ${formatLocalTime(nextCheck)} (${rechecks + 1}/${usageLimitMaxRechecks})`,
+            )
+            return true
+        }
+
+        if (!probe.limitReached) {
+            await log(
+                "info",
+                `Usage-limit signal on ${short(sid)} is stale: usage endpoint reports ` +
+                    `${providerID ?? "?"}/${modelID ?? "?"} available; falling back to normal recovery`,
+            )
+            return false
+        }
+
+        if (probe.resumeAtMs === null) {
+            if (rechecks >= usageLimitMaxRechecks) {
+                await log(
+                    "warn",
+                    `Usage limit on ${short(sid)}: reset moment still unknown after ${rechecks} rechecks; giving up`,
+                )
+                clearUsageLimit(w, sid, "rechecks exhausted")
+                return true
+            }
+            const nextCheck = now + usageLimitRecheckMs
+            await armUsageLimitResume(
+                sid,
+                w,
+                nextCheck,
+                probe.resetAtMs,
+                probe.decidingWindow,
+                providerID,
+                modelID,
+                rechecks + 1,
+            )
+            await log(
+                "warn",
+                `Usage limit on ${short(sid)}: reset moment unknown, recheck at ` +
+                    `${formatLocalTime(nextCheck)} (${rechecks + 1}/${usageLimitMaxRechecks})`,
+            )
+            return true
+        }
+
+        await armUsageLimitResume(
+            sid,
+            w,
+            probe.resumeAtMs,
+            probe.resetAtMs,
+            probe.decidingWindow,
+            providerID,
+            modelID,
+            rechecks,
+        )
+        return true
+    }
+
+    async function onUsageLimitTimer(sid: string): Promise<void> {
+        const w = sessions.get(sid)
+        if (!w || !w.usageLimit) return
+        const wait = w.usageLimit
+        wait.timer = null
+        if (w.userCancelled || w.completionSignaled) {
+            clearUsageLimit(w, sid, "session closed by user")
+            return
+        }
+        await log("info", `Usage-limit wait elapsed on ${short(sid)}: re-checking Codex usage`)
+        const probe = await probeUsageLimits(wait.modelID)
+        const stillWaiting = await applyUsageLimitProbe(
+            sid,
+            w,
+            probe,
+            wait.providerID,
+            wait.modelID,
+            wait.rechecks,
+        )
+        if (stillWaiting) return
+        clearUsageLimit(w, sid, "limit reset")
+        await log("info", `${short(sid)} - usage limit reset, resuming`)
+        try {
+            await sendContinuePrompt(sid, continuePrompt, w)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - resume after usage limit failed: ${errMsg}`)
+        }
+    }
+
+    async function handleUsageLimitSignal(
+        sid: string,
+        errorName: string,
+        errorMessage: string,
+    ): Promise<boolean> {
+        if (!usageLimitEnabled || !sid) return false
+        if (!isUsageLimitSignal(errorName, errorMessage)) return false
+        const { providerID, modelID } = await getSessionProviderModel(sid)
+        const provider = (providerID ?? "").toLowerCase()
+        if (!provider) {
+            await log(
+                "info",
+                `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`,
+            )
+            return false
+        }
+        if (!usageLimitProviders.includes(provider)) {
+            await log(
+                "info",
+                `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` +
+                    `usageLimitProviders (${usageLimitProviders.join(", ")})`,
+            )
+            return false
+        }
+        await log(
+            "info",
+            `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` +
+                `${truncateForLog(errorMessage)}; querying Codex usage endpoint`,
+        )
+        const w = ensureWatch(sid)
+        const probe = await probeUsageLimits(modelID)
+        return await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
+    }
+
+    function truncateForLog(text: string, limit = 200): string {
+        if (!text) return "(empty)"
+        return text.length > limit ? `${text.slice(0, limit)}...` : text
+    }
+
+    // -----------------------------------------------------------------------
     // Resume: normal stall
     // -----------------------------------------------------------------------
 
     async function tryResume(sid: string, w: SessionWatch, reason: string, prompt?: string): Promise<boolean> {
         if (typeof sid !== "string" || !sid) {
             await log("warn", `tryResume called with invalid sid: ${sid}`)
+            return false
+        }
+        if (w.usageLimit) {
+            dbg(`Resume suppressed on ${short(sid)}: usage limit wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
             return false
         }
         const now = Date.now()
@@ -1793,6 +2223,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     !w.aborting &&
                     !w.continuing &&
                     !w.gaveUp &&
+                    !w.usageLimit &&
                     // recoveryAttempts === 0: the watchdog chain owns the
                     // counter once the first recovery send is initiated (WP-05)
                     w.recoveryAttempts === 0
@@ -1910,6 +2341,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     w.status = "idle"
                     resetIdleFlags(w)
                     w.userCancelled = true
+                    clearUsageLimit(w, sid, "interrupted by user")
                     if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
                     prevBusyCount = busyCount()
                     log("info", `${short(sid)} -> interrupted by user, backing off`)
@@ -1934,13 +2366,22 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             !w.pendingRecovery &&
                             !w.completionSignaled &&
                             !w.userCancelled &&
-                            !w.aborting
+                            !w.aborting &&
+                            !w.usageLimit
                         ) {
                             try {
                                 const errInfo = getLastAssistantError(
                                     await getSessionMessages(sid),
                                 )
+                                const usageLimitHandled =
+                                    errInfo !== null &&
+                                    (await handleUsageLimitSignal(
+                                        sid,
+                                        errInfo.name,
+                                        errInfo.message,
+                                    ))
                                 if (
+                                    !usageLimitHandled &&
                                     errInfo &&
                                     isStreamingFailure(
                                         errInfo.name,
@@ -2201,6 +2642,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             w.userCancelled = true
                             w.status = "idle"
                             resetIdleFlags(w)
+                            clearUsageLimit(w, wSid, "user abort")
                         }
                     }
                     log("info", "User abort (ESC)")
@@ -2214,7 +2656,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     streamingFailureMessagePatterns,
                 )
 
-                if (isStreamingFail) {
+                const armStreamingFailure = async (): Promise<void> => {
                     if (sid) {
                         const w = sessions.get(sid)
                         if (w && w.status === "busy") {
@@ -2228,6 +2670,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     } else {
                         log("warn", `Streaming failure detected but no session ID: ${errorName} - ${errorMessage}`)
                     }
+                }
+
+                if (isUsageLimitSignal(errorName, errorMessage)) {
+                    // Probing the usage endpoint is async; the synchronous
+                    // pendingRecovery bookkeeping below must not be delayed,
+                    // otherwise racing status events reorder the recovery.
+                    void (async () => {
+                        const armed = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage)
+                        if (!armed && isStreamingFail) await armStreamingFailure()
+                    })()
+                } else if (isStreamingFail) {
+                    await armStreamingFailure()
                 }
 
                 if (busyCount() === 0) break
