@@ -12972,6 +12972,7 @@ var AutoResumePlugin = async (ctx, options) => {
       console.error("[auto-resume] log() failed:", e instanceof Error ? e.message : String(e));
     }
   }
+  log("info", `auto-resume initialized (v1.2.0): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` + ` for providers [${usageLimitProviders.join(", ")}]`);
   async function safe(fn, ctxLabel) {
     try {
       return await fn();
@@ -14119,6 +14120,11 @@ var AutoResumePlugin = async (ctx, options) => {
       return false;
     if (!isUsageLimitSignal(errorName, errorMessage))
       return false;
+    const existing = sessions.get(sid)?.usageLimit;
+    if (existing && existing.resumeAtMs > Date.now()) {
+      dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(existing.resumeAtMs)}`);
+      return true;
+    }
     const { providerID, modelID } = await getSessionProviderModel(sid);
     const provider = (providerID ?? "").toLowerCase();
     if (!provider) {
