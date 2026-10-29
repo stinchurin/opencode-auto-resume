@@ -12795,12 +12795,13 @@ function getLastAssistantError(messages) {
     if (role !== "assistant")
       continue;
     const info = msg.info;
+    const id = msg.id ?? info?.id ?? null;
     const err = msg.error ?? info?.error;
     if (err) {
       const data = err.data;
       const name = err.name ?? "";
       const message = data?.message ?? err.message ?? "";
-      return { name, message };
+      return { name, message, id };
     }
     const parts = msg.parts;
     if (parts) {
@@ -12814,9 +12815,10 @@ function getLastAssistantError(messages) {
         const data = partErr.data;
         const name = partErr.name ?? "";
         const message = data?.message ?? partErr.message ?? "";
-        return { name, message };
+        return { name, message, id };
       }
     }
+    return null;
   }
   return null;
 }
@@ -12973,7 +12975,7 @@ var AutoResumePlugin = async (ctx, options) => {
       console.error("[auto-resume] log() failed:", e instanceof Error ? e.message : String(e));
     }
   }
-  log("info", `auto-resume initialized (v1.2.1): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` + ` for providers [${usageLimitProviders.join(", ")}]`);
+  log("info", `auto-resume initialized (v1.2.2): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` + ` for providers [${usageLimitProviders.join(", ")}]`);
   async function safe(fn, ctxLabel) {
     try {
       return await fn();
@@ -13025,7 +13027,8 @@ var AutoResumePlugin = async (ctx, options) => {
         pendingRecoveryAt: 0,
         recoveryAttempts: 0,
         watchdogRetryGuard: false,
-        usageLimit: null
+        usageLimit: null,
+        lastUsageLimitErrorId: null
       };
       sessions.set(sid, w);
     }
@@ -14117,30 +14120,40 @@ var AutoResumePlugin = async (ctx, options) => {
       await log("warn", `${short(sid)} - resume after usage limit failed: ${errMsg}`);
     }
   }
-  async function handleUsageLimitSignal(sid, errorName, errorMessage) {
+  async function handleUsageLimitSignal(sid, errorName, errorMessage, errorId = null) {
     if (!usageLimitEnabled || !sid)
-      return false;
+      return "ignored";
     if (!isUsageLimitSignal(errorName, errorMessage))
-      return false;
-    const existing = sessions.get(sid)?.usageLimit;
-    if (existing && existing.resumeAtMs > Date.now()) {
-      dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(existing.resumeAtMs)}`);
-      return true;
+      return "ignored";
+    const w = ensureWatch(sid);
+    if (errorId && w.lastUsageLimitErrorId === errorId) {
+      dbg(`Usage-limit error ${errorId} on ${short(sid)} already handled; suppressing repeat recovery`);
+      return "handled";
     }
-    const { providerID, modelID } = await getSessionProviderModel(sid);
+    if (w.usageLimit && w.usageLimit.resumeAtMs > Date.now()) {
+      dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(w.usageLimit.resumeAtMs)}`);
+      if (errorId)
+        w.lastUsageLimitErrorId = errorId;
+      return "handled";
+    }
+    const providerInfo = await getSessionProviderModel(sid);
+    const providerID = providerInfo.providerID;
+    const modelID = providerInfo.modelID;
     const provider = (providerID ?? "").toLowerCase();
     if (!provider) {
       await log("info", `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`);
-      return false;
+      return "ignored";
     }
     if (!usageLimitProviders.includes(provider)) {
       await log("info", `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` + `usageLimitProviders (${usageLimitProviders.join(", ")})`);
-      return false;
+      return "ignored";
     }
     await log("info", `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` + `${truncateForLog(errorMessage)}; querying Codex usage endpoint`);
-    const w = ensureWatch(sid);
+    if (errorId)
+      w.lastUsageLimitErrorId = errorId;
     const probe = await probeUsageLimits(modelID);
-    return await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0);
+    await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0);
+    return "handled";
   }
   function truncateForLog(text, limit = 200) {
     if (!text)
@@ -14483,8 +14496,8 @@ var AutoResumePlugin = async (ctx, options) => {
             if (!w.pendingRecovery && !w.completionSignaled && !w.userCancelled && !w.aborting && !w.usageLimit) {
               try {
                 const errInfo = getLastAssistantError(await getSessionMessages(sid));
-                const usageLimitHandled = errInfo !== null && await handleUsageLimitSignal(sid, errInfo.name, errInfo.message);
-                if (!usageLimitHandled && errInfo && isStreamingFailure(errInfo.name, errInfo.message, streamingFailureErrorNames, streamingFailureMessagePatterns)) {
+                const usageLimitOutcome = errInfo === null ? "ignored" : await handleUsageLimitSignal(sid, errInfo.name, errInfo.message, errInfo.id);
+                if (usageLimitOutcome === "ignored" && errInfo && isStreamingFailure(errInfo.name, errInfo.message, streamingFailureErrorNames, streamingFailureMessagePatterns)) {
                   w.pendingRecovery = true;
                   w.pendingRecoveryReason = errInfo.name;
                   w.pendingRecoveryAt = Date.now();
@@ -14718,8 +14731,8 @@ var AutoResumePlugin = async (ctx, options) => {
         };
         if (isUsageLimitSignal(errorName, errorMessage)) {
           (async () => {
-            const armed = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage);
-            if (!armed && isStreamingFail)
+            const outcome = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage);
+            if (outcome === "ignored" && isStreamingFail)
               await armStreamingFailure();
           })();
         } else if (isStreamingFail) {

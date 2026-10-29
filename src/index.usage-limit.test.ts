@@ -274,3 +274,96 @@ describe("usage limit: wait survives idle eviction", () => {
         expect(hasLog(logCalls, "usage limit reset, resuming")).toBe(true)
     })
 })
+
+describe("usage limit: no recovery loop after the limit lifts", () => {
+    const limitError = {
+        id: "msg_err",
+        info: { role: "assistant", providerID: "openai", modelID: "gpt-6.1-sol" },
+        error: { name: "APIError", data: { message: "The usage limit has been reached" } },
+    }
+
+    test("a normal reply after the wait stops further continues", async () => {
+        const { ctx, logCalls, promptCalls } = createContext()
+        const messages: any[] = [limitError]
+        ctx.client.session.messages = mock(async () => messages)
+
+        let probes = 0
+        const hooks: any = await AutoResumePlugin(ctx, {
+            checkIntervalMs: 100_000,
+            usageLimitGraceMs: 0,
+            usageLimitProbe: async () => {
+                probes++
+                return {
+                    ok: true,
+                    limitReached: probes === 1,
+                    resetAtMs: Date.now() + 1_000,
+                    resumeAtMs: Date.now() + 1_100,
+                    decidingWindow: "primary",
+                    graceMs: 0,
+                }
+            },
+        } as any)
+        const sid = "ses_loop1"
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } })
+        await hooks.event({ event: USAGE_LIMIT_EVENT(sid) })
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+
+        for (let i = 0; i < 40 && promptCalls.length === 0; i++) await wait(100)
+        expect(promptCalls.length).toBe(1)
+
+        messages.push(
+            { role: "user", parts: [{ type: "text", text: "continue" }] },
+            { id: "msg_ok", info: { role: "assistant", providerID: "openai", modelID: "gpt-6.1-sol" }, parts: [{ type: "text", text: "Что сделать?" }] },
+        )
+
+        for (let i = 0; i < 3; i++) {
+            await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } })
+            await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+            await wait(120)
+        }
+
+        expect(promptCalls.length).toBe(1)
+        expect(hasLog(logCalls, "streaming failure detected on idle")).toBe(false)
+    })
+
+    test("a stale limit error keeps its id and is not re-probed", async () => {
+        const { ctx, logCalls, promptCalls } = createContext()
+        const messages: any[] = [limitError]
+        ctx.client.session.messages = mock(async () => messages)
+
+        let probes = 0
+        const hooks: any = await AutoResumePlugin(ctx, {
+            checkIntervalMs: 100_000,
+            usageLimitGraceMs: 0,
+            usageLimitProbe: async () => {
+                probes++
+                return {
+                    ok: true,
+                    limitReached: probes === 1,
+                    resetAtMs: Date.now() + 1_000,
+                    resumeAtMs: Date.now() + 1_100,
+                    decidingWindow: "primary",
+                    graceMs: 0,
+                }
+            },
+        } as any)
+        const sid = "ses_loop2"
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } })
+        await hooks.event({ event: USAGE_LIMIT_EVENT(sid) })
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+        for (let i = 0; i < 40 && promptCalls.length === 0; i++) await wait(100)
+
+        const probesAfterFirstIdle = probes
+        for (let i = 0; i < 3; i++) {
+            await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } })
+            await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+            await wait(120)
+        }
+
+        expect(probes).toBeLessThanOrEqual(probesAfterFirstIdle + 1)
+        expect(promptCalls.length).toBeLessThanOrEqual(1)
+        expect(hasLog(logCalls, "already handled; suppressing repeat recovery")).toBe(false)
+    })
+})

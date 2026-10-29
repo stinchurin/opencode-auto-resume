@@ -74,6 +74,35 @@ const API_ERROR_503 = {
 }
 
 describe("getLastAssistantError()", () => {
+    test("does not resurrect an older error once a newer assistant reply arrived", () => {
+        expect(
+            getLastAssistantError([
+                {
+                    id: "msg_err",
+                    role: "assistant",
+                    error: {
+                        name: "APIError",
+                        data: { message: "The usage limit has been reached" },
+                    },
+                },
+                { role: "user", parts: [{ type: "text", text: "continue" }] },
+                { id: "msg_ok", role: "assistant", parts: [{ type: "text", text: "Что сделать?" }] },
+            ]),
+        ).toBeNull()
+    })
+
+    test("exposes the error message id for de-duplication", () => {
+        expect(
+            getLastAssistantError([
+                {
+                    id: "msg_abc",
+                    role: "assistant",
+                    error: { name: "APIError", data: { message: "boom" } },
+                },
+            ]),
+        ).toMatchObject({ id: "msg_abc", name: "APIError" })
+    })
+
     test("returns null when no assistant message exists", () => {
         expect(getLastAssistantError([])).toBeNull()
         expect(
@@ -99,7 +128,7 @@ describe("getLastAssistantError()", () => {
                 },
             },
         ])
-        expect(result).toEqual({
+        expect(result).toMatchObject({
             name: "APIError",
             message: "Streaming response failed",
         })
@@ -117,7 +146,7 @@ describe("getLastAssistantError()", () => {
                 },
             },
         ])
-        expect(result).toEqual({ name: "ProviderError", message: "stream failed" })
+        expect(result).toMatchObject({ name: "ProviderError", message: "stream failed" })
     })
 
     test("returns the LAST assistant message's error, not an earlier one", () => {
@@ -132,7 +161,7 @@ describe("getLastAssistantError()", () => {
                 error: { name: "NewError", data: { message: "new" } },
             },
         ])
-        expect(result).toEqual({ name: "NewError", message: "new" })
+        expect(result).toMatchObject({ name: "NewError", message: "new" })
     })
 
     test("falls back to error.message when data.message is absent", () => {
@@ -142,7 +171,7 @@ describe("getLastAssistantError()", () => {
                 error: { name: "StreamError", message: "fallback message" },
             },
         ])
-        expect(result).toEqual({ name: "StreamError", message: "fallback message" })
+        expect(result).toMatchObject({ name: "StreamError", message: "fallback message" })
     })
 
     test("scans retry parts for an ApiError", () => {
@@ -161,7 +190,7 @@ describe("getLastAssistantError()", () => {
                 ],
             },
         ])
-        expect(result).toEqual({
+        expect(result).toMatchObject({
             name: "APIError",
             message: "Streaming response failed: [503]",
         })
@@ -180,7 +209,7 @@ describe("getLastAssistantError()", () => {
                 ],
             },
         ])
-        expect(result).toEqual({ name: "TopError", message: "top" })
+        expect(result).toMatchObject({ name: "TopError", message: "top" })
     })
 })
 

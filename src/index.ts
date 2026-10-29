@@ -89,6 +89,7 @@ export interface SessionWatch {
     recoveryAttempts: number
     watchdogRetryGuard: boolean
     usageLimit: UsageLimitWait | null
+    lastUsageLimitErrorId: string | null
 }
 
 const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
@@ -293,14 +294,14 @@ function isStreamingFailure(
 }
 
 /**
- * Extract the most recent assistant-message error from a message list.
- * Checks (in priority order): message.error, message.info.error, and
- * any `type === "retry"` part's `error` field (SDK RetryPart surface).
- * Returns `{ name, message }` or null if no assistant message has an error.
+ * Error of the NEWEST assistant message. Older errors are stale by definition:
+ * once the model produced a new message, a previous failure is history and
+ * acting on it turns every idle transition into another recovery attempt.
+ * Checks message.error, message.info.error and `type === "retry"` parts.
  */
 function getLastAssistantError(
     messages: Array<Record<string, unknown>>,
-): { name: string; message: string } | null {
+): { name: string; message: string; id: string | null } | null {
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i]
         const role =
@@ -309,6 +310,10 @@ function getLastAssistantError(
         if (role !== "assistant") continue
 
         const info = msg.info as Record<string, unknown> | undefined
+        const id =
+            (msg.id as string | undefined) ??
+            (info?.id as string | undefined) ??
+            null
         const err =
             (msg.error as Record<string, unknown> | undefined) ??
             (info?.error as Record<string, unknown> | undefined)
@@ -317,7 +322,7 @@ function getLastAssistantError(
             const name = (err.name as string) ?? ""
             const message =
                 (data?.message as string) ?? (err.message as string) ?? ""
-            return { name, message }
+            return { name, message, id }
         }
 
         const parts = msg.parts as Array<Record<string, unknown>> | undefined
@@ -337,9 +342,10 @@ function getLastAssistantError(
                     (data?.message as string) ??
                     (partErr.message as string) ??
                     ""
-                return { name, message }
+                return { name, message, id }
             }
         }
+        return null
     }
     return null
 }
@@ -563,7 +569,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     void log(
         "info",
-        `auto-resume initialized (v1.2.1): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` +
+        `auto-resume initialized (v1.2.2): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` +
             ` for providers [${usageLimitProviders.join(", ")}]`,
     )
 
@@ -618,6 +624,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 recoveryAttempts: 0,
                 watchdogRetryGuard: false,
                 usageLimit: null,
+                lastUsageLimitErrorId: null,
             }
             sessions.set(sid, w)
         }
@@ -1952,22 +1959,30 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         sid: string,
         errorName: string,
         errorMessage: string,
-    ): Promise<boolean> {
-        if (!usageLimitEnabled || !sid) return false
-        if (!isUsageLimitSignal(errorName, errorMessage)) return false
-        const existing = sessions.get(sid)?.usageLimit
-        if (existing && existing.resumeAtMs > Date.now()) {
-            dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(existing.resumeAtMs)}`)
-            return true
+        errorId: string | null = null,
+    ): Promise<"handled" | "ignored"> {
+        if (!usageLimitEnabled || !sid) return "ignored"
+        if (!isUsageLimitSignal(errorName, errorMessage)) return "ignored"
+        const w = ensureWatch(sid)
+        if (errorId && w.lastUsageLimitErrorId === errorId) {
+            dbg(`Usage-limit error ${errorId} on ${short(sid)} already handled; suppressing repeat recovery`)
+            return "handled"
         }
-        const { providerID, modelID } = await getSessionProviderModel(sid)
+        if (w.usageLimit && w.usageLimit.resumeAtMs > Date.now()) {
+            dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
+            if (errorId) w.lastUsageLimitErrorId = errorId
+            return "handled"
+        }
+        const providerInfo = await getSessionProviderModel(sid)
+        const providerID = providerInfo.providerID
+        const modelID = providerInfo.modelID
         const provider = (providerID ?? "").toLowerCase()
         if (!provider) {
             await log(
                 "info",
                 `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`,
             )
-            return false
+            return "ignored"
         }
         if (!usageLimitProviders.includes(provider)) {
             await log(
@@ -1975,16 +1990,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` +
                     `usageLimitProviders (${usageLimitProviders.join(", ")})`,
             )
-            return false
+            return "ignored"
         }
         await log(
             "info",
             `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` +
                 `${truncateForLog(errorMessage)}; querying Codex usage endpoint`,
         )
-        const w = ensureWatch(sid)
+        if (errorId) w.lastUsageLimitErrorId = errorId
         const probe = await probeUsageLimits(modelID)
-        return await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
+        await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
+        return "handled"
     }
 
     function truncateForLog(text: string, limit = 200): string {
@@ -2386,15 +2402,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                                 const errInfo = getLastAssistantError(
                                     await getSessionMessages(sid),
                                 )
-                                const usageLimitHandled =
-                                    errInfo !== null &&
-                                    (await handleUsageLimitSignal(
-                                        sid,
-                                        errInfo.name,
-                                        errInfo.message,
-                                    ))
+                                const usageLimitOutcome =
+                                    errInfo === null
+                                        ? "ignored"
+                                        : await handleUsageLimitSignal(
+                                              sid,
+                                              errInfo.name,
+                                              errInfo.message,
+                                              errInfo.id,
+                                          )
                                 if (
-                                    !usageLimitHandled &&
+                                    usageLimitOutcome === "ignored" &&
                                     errInfo &&
                                     isStreamingFailure(
                                         errInfo.name,
@@ -2690,8 +2708,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     // pendingRecovery bookkeeping below must not be delayed,
                     // otherwise racing status events reorder the recovery.
                     void (async () => {
-                        const armed = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage)
-                        if (!armed && isStreamingFail) await armStreamingFailure()
+                        const outcome = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage)
+                        if (outcome === "ignored" && isStreamingFail) await armStreamingFailure()
                     })()
                 } else if (isStreamingFail) {
                     await armStreamingFailure()

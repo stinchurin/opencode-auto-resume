@@ -101,7 +101,7 @@ export function isStreamingFailure(
 
 export function getLastAssistantError(
     messages: Array<Record<string, unknown>>,
-): { name: string; message: string } | null {
+): { name: string; message: string; id: string | null } | null {
     for (let i = messages.length - 1; i >= 0; i--) {
         const msg = messages[i]
         const role =
@@ -110,6 +110,10 @@ export function getLastAssistantError(
         if (role !== "assistant") continue
 
         const info = msg.info as Record<string, unknown> | undefined
+        const id =
+            (msg.id as string | undefined) ??
+            (info?.id as string | undefined) ??
+            null
         const err =
             (msg.error as Record<string, unknown> | undefined) ??
             (info?.error as Record<string, unknown> | undefined)
@@ -118,7 +122,7 @@ export function getLastAssistantError(
             const name = (err.name as string) ?? ""
             const message =
                 (data?.message as string) ?? (err.message as string) ?? ""
-            return { name, message }
+            return { name, message, id }
         }
 
         const parts = msg.parts as Array<Record<string, unknown>> | undefined
@@ -138,9 +142,10 @@ export function getLastAssistantError(
                     (data?.message as string) ??
                     (partErr.message as string) ??
                     ""
-                return { name, message }
+                return { name, message, id }
             }
         }
+        return null
     }
     return null
 }
