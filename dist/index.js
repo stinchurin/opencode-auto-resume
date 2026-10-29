@@ -12922,6 +12922,7 @@ var AutoResumePlugin = async (ctx, options) => {
   const usageLimitRecheckMs = options?.usageLimitRecheckMs ?? DEFAULT_USAGE_LIMIT_RECHECK_MS;
   const usageLimitMaxRechecks = options?.usageLimitMaxRechecks ?? DEFAULT_USAGE_LIMIT_MAX_RECHECKS;
   const usageLimitMaxWaitMs = options?.usageLimitMaxWaitMs ?? DEFAULT_USAGE_LIMIT_MAX_WAIT_MS;
+  const idleCleanupMs = options?.idleCleanupMs ?? IDLE_CLEANUP_MS;
   const usageLimitScript = options?.usageLimitScript ?? null;
   const usageLimitProbeOption = options?.usageLimitProbe;
   const dbg = (...args) => {
@@ -13089,18 +13090,19 @@ var AutoResumePlugin = async (ctx, options) => {
     const now = Date.now();
     const toDelete = [];
     let idleCount = 0;
+    const evictable = (w) => w.status !== "busy" && !w.usageLimit;
     for (const [sid, w] of sessions) {
-      if (w.status !== "busy") {
-        idleCount++;
-        if (w.idleSince && now - w.idleSince > IDLE_CLEANUP_MS) {
-          toDelete.push(sid);
-        }
+      if (!evictable(w))
+        continue;
+      idleCount++;
+      if (w.idleSince && now - w.idleSince > idleCleanupMs) {
+        toDelete.push(sid);
       }
     }
     if (idleCount > MAX_IDLE_SESSIONS) {
       const idleEntries = [];
       for (const [sid, w] of sessions) {
-        if (w.status !== "busy" && w.idleSince) {
+        if (evictable(w) && w.idleSince) {
           idleEntries.push({ sid, idleSince: w.idleSince });
         }
       }

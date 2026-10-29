@@ -234,3 +234,43 @@ describe("usage limit: resolving the reset moment", () => {
         expect(promptCalls.length).toBe(0)
     })
 })
+
+describe("usage limit: wait survives idle eviction", () => {
+    test("armed wait is not dropped by cleanupIdleSessions", async () => {
+        const { ctx, logCalls, promptCalls } = createContext()
+        let probeCalls = 0
+        const hooks: any = await AutoResumePlugin(ctx, {
+            checkIntervalMs: 50,
+            idleCleanupMs: 100,
+            usageLimitRecheckMs: 50,
+            usageLimitProbe: async () => {
+                probeCalls++
+                return {
+                    ok: true,
+                    limitReached: probeCalls === 1,
+                    resetAtMs: Date.now() + 1_000,
+                    resumeAtMs: Date.now() + 1_100,
+                    decidingWindow: "primary",
+                    graceMs: 0,
+                }
+            },
+        } as any)
+        const sid = "ses_ul09"
+
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "busy" } } })
+        await hooks.event({ event: USAGE_LIMIT_EVENT(sid) })
+        await hooks.event({ event: { type: "session.status", sessionID: sid, properties: { status: "idle" } } })
+
+        const resumed = await (async () => {
+            for (let i = 0; i < 40; i++) {
+                if (promptCalls.length > 0) return true
+                await wait(100)
+            }
+            return false
+        })()
+
+        expect(resumed).toBe(true)
+        expect(promptCalls.length).toBe(1)
+        expect(hasLog(logCalls, "usage limit reset, resuming")).toBe(true)
+    })
+})

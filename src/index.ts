@@ -505,6 +505,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         (options?.usageLimitMaxRechecks as number) ?? DEFAULT_USAGE_LIMIT_MAX_RECHECKS
     const usageLimitMaxWaitMs: number =
         (options?.usageLimitMaxWaitMs as number) ?? DEFAULT_USAGE_LIMIT_MAX_WAIT_MS
+    const idleCleanupMs: number =
+        (options?.idleCleanupMs as number) ?? IDLE_CLEANUP_MS
     const usageLimitScript: string | null =
         (options?.usageLimitScript as string) ?? null
     const usageLimitProbeOption = options?.usageLimitProbe as
@@ -695,20 +697,20 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         const now = Date.now()
         const toDelete: string[] = []
         let idleCount = 0
+        const evictable = (w: SessionWatch): boolean => w.status !== "busy" && !w.usageLimit
 
         for (const [sid, w] of sessions) {
-            if (w.status !== "busy") {
-                idleCount++
-                if (w.idleSince && (now - w.idleSince) > IDLE_CLEANUP_MS) {
-                    toDelete.push(sid)
-                }
+            if (!evictable(w)) continue
+            idleCount++
+            if (w.idleSince && (now - w.idleSince) > idleCleanupMs) {
+                toDelete.push(sid)
             }
         }
 
         if (idleCount > MAX_IDLE_SESSIONS) {
             const idleEntries: Array<{ sid: string; idleSince: number }> = []
             for (const [sid, w] of sessions) {
-                if (w.status !== "busy" && w.idleSince) {
+                if (evictable(w) && w.idleSince) {
                     idleEntries.push({ sid, idleSince: w.idleSince })
                 }
             }
