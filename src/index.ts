@@ -563,7 +563,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
     void log(
         "info",
-        `auto-resume initialized (v1.2.0): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` +
+        `auto-resume initialized (v1.2.1): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` +
             ` for providers [${usageLimitProviders.join(", ")}]`,
     )
 

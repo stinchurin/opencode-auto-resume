@@ -12973,7 +12973,7 @@ var AutoResumePlugin = async (ctx, options) => {
       console.error("[auto-resume] log() failed:", e instanceof Error ? e.message : String(e));
     }
   }
-  log("info", `auto-resume initialized (v1.2.0): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` + ` for providers [${usageLimitProviders.join(", ")}]`);
+  log("info", `auto-resume initialized (v1.2.1): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` + ` for providers [${usageLimitProviders.join(", ")}]`);
   async function safe(fn, ctxLabel) {
     try {
       return await fn();
