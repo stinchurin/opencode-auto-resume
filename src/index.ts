@@ -7,6 +7,9 @@ import type { Plugin } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import type { SessionPromptResponses } from "@opencode-ai/sdk"
 import { execFile } from "node:child_process"
+import { mkdir, rename, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import {
     evaluateCodexLimits,
     formatDuration,
@@ -89,6 +92,7 @@ export interface SessionWatch {
     recoveryAttempts: number
     watchdogRetryGuard: boolean
     usageLimit: UsageLimitWait | null
+    usageLimitPending: boolean
     lastUsageLimitErrorId: string | null
 }
 
@@ -116,6 +120,24 @@ const DEFAULT_USAGE_LIMIT_RECHECK_MS = 10 * 60_000
 const DEFAULT_USAGE_LIMIT_MAX_RECHECKS = 6
 const DEFAULT_USAGE_LIMIT_MAX_WAIT_MS = 8 * 24 * 60 * 60_000
 const MAX_TIMER_DELAY_MS = 2_147_000_000
+
+const DEFAULT_STALE_TASK_GUARD_TIMEOUT_MS = 3_000
+const DEFAULT_BG_SNAPSHOT_DIR = join(homedir(), ".local", "share", "opencode", "bg-results")
+
+// Injected into a `task` call when its task_id points to a session that vanished
+// from storage (opencode loses session.created for background subagents).
+const STALE_TASK_NOTE =
+    "NOTE: The task_id you referenced points to a session that is no longer available in storage. " +
+    "Continue as a fresh subagent session: do not try to read or continue the old one, and " +
+    "reconstruct any needed context from your task description and the repository state."
+
+// Injected into the resume prompt after a usage-limit wait: long pauses can lose
+// background subagent sessions, so the model restarts them instead of blocking.
+const RESUME_AFTER_PAUSE_NOTE =
+    "NOTE: This session was resumed automatically after waiting out a provider usage-limit window. " +
+    "Long pauses can lose background subagent sessions from storage: if a task_id, background_output " +
+    "or session reference no longer resolves, do not block on it and do not excavate local storage — " +
+    "restart that subagent task fresh or re-derive the result from on-disk evidence, then continue the plan."
 
 const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
     "ProviderError",
@@ -263,6 +285,22 @@ function containsDoneClaimPattern(text: string): boolean {
     const lines = text.split('\n')
     const lastLines = lines.slice(-5).join('\n')
     return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+// Heuristic, not proof: real reports carry paths/code/commands/results or are long; bare claims are short prose.
+const WORK_REPORT_MIN_LENGTH = 400
+
+const WORK_REPORT_SIGNAL_PATTERNS = [
+    /`[^`\n]+`/,
+    /[\w.@~-]+\/[\w.@~-]+/,
+    /\b(?:bun|npm|npx|node|git|mvn|gradle|pytest|cargo|make)\s+\S+/i,
+    /\b\d+\s*\/\s*\d+\b/,
+]
+
+function containsWorkDescription(text: string): boolean {
+    const trimmed = text.trim()
+    if (trimmed.length >= WORK_REPORT_MIN_LENGTH) return true
+    return WORK_REPORT_SIGNAL_PATTERNS.some((pat) => pat.test(trimmed))
 }
 
 function isStreamingFailure(
@@ -438,6 +476,31 @@ function buildOpenTodosReminder(todos: Todo[]): string {
     return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
 }
 
+// \b is ASCII-only: Cyrillic word boundaries need \p{L}/\p{N} lookarounds + u flag.
+const WAITING_FOR_INPUT_MARKERS: RegExp[] = [
+    /жд(?:ут|у|ёт|ет|ем|ём)\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений)/i,
+    /ожидает\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений|ввода)/i,
+    /(?<![\p{L}\p{N}_])подтвердите(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])ответьте(?![\p{L}\p{N}_])/iu,
+    /waiting\s+for\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /await(?:s|ing)\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /please\s+(?:confirm|answer|reply)/i,
+]
+
+/**
+ * Mirrored in test-utils.ts for unit tests — must NOT be exported here:
+ * OpenCode's plugin loader calls every module export as a Plugin entrypoint
+ * (see the exports-guard test).
+ */
+function textWaitsForUserInput(text: string): boolean {
+    if (!text) return false
+    const cleaned = text.replace(/```[\s\S]*?```/g, " ").trim()
+    if (!cleaned) return false
+    const lastLine = cleaned.split("\n").reverse().find(l => l.trim().length > 0)?.trim() ?? ""
+    if (/\?[\s)\]>*_~"'»]*$/.test(lastLine)) return true
+    return WAITING_FOR_INPUT_MARKERS.some(re => re.test(cleaned))
+}
+
 export const AutoResumePlugin: Plugin = async (ctx, options) => {
     const chunkTimeoutMs: number =
     (options?.chunkTimeoutMs as number) ?? DEFAULT_CHUNK_TIMEOUT_MS
@@ -472,7 +535,11 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     const streamingFailureMessagePatterns: string[] =
         (options?.streamingFailureMessagePatterns as string[]) ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
     const resumeOnActionIntent: boolean =
-    (options?.resumeOnActionIntent as boolean) !== false
+        (options?.resumeOnActionIntent as boolean) !== false
+    const openTodosNudgeEnabled: boolean =
+        (options?.openTodosNudge as boolean) !== false
+    const doneClaimNudgeEnabled: boolean =
+        (options?.doneClaimNudge as boolean) !== false
     const continuePrompt: string =
     (options?.continuePrompt as string) ?? "continue"
     const actionIntentPrompt: string =
@@ -515,6 +582,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         (options?.idleCleanupMs as number) ?? IDLE_CLEANUP_MS
     const usageLimitScript: string | null =
         (options?.usageLimitScript as string) ?? null
+    const staleTaskGuardEnabled: boolean =
+        (options?.staleTaskGuardEnabled as boolean) !== false
+    const staleTaskGuardTimeoutMs: number =
+        (options?.staleTaskGuardTimeoutMs as number) ?? DEFAULT_STALE_TASK_GUARD_TIMEOUT_MS
+    const resumeNoteEnabled: boolean =
+        (options?.resumeNoteEnabled as boolean) !== false
+    const resumeNoteText: string =
+        (options?.resumeNoteText as string) ?? RESUME_AFTER_PAUSE_NOTE
+    const bgSnapshotEnabled: boolean =
+        (options?.bgSnapshotEnabled as boolean) !== false
+    const bgSnapshotDir: string =
+        (options?.bgSnapshotDir as string) ?? DEFAULT_BG_SNAPSHOT_DIR
     const usageLimitProbeOption = options?.usageLimitProbe as
         | ((modelID: string | null) => Promise<UsageLimitProbe>)
         | undefined
@@ -624,6 +703,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 recoveryAttempts: 0,
                 watchdogRetryGuard: false,
                 usageLimit: null,
+                usageLimitPending: false,
                 lastUsageLimitErrorId: null,
             }
             sessions.set(sid, w)
@@ -789,12 +869,20 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("debug", `${short(context.sessionId)} - session.prompt() raw response: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result, null, 2) })}`)
     }
 
-    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch) {
+    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch): Promise<boolean> {
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Continue prompt suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
+            return false
+        }
         if (w.continuing && !w.watchdogRetryGuard) {
             await log("debug", `${short(sid)} - continue already in progress, skipping`)
-            return
+            return false
         }
-        if (w.userCancelled || w.completionSignaled) return
+        if (w.userCancelled || w.completionSignaled) return false
+        if (await isQuestionPending(sid)) {
+            dbg(`Continue prompt suppressed on ${short(sid)}: user question pending`)
+            return false
+        }
         if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
         w.continuing = true
         if (w.watchdogRetryGuard) {
@@ -939,6 +1027,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 }
             }
         }, toolTextCheckDelayMs)
+        return true
     }
 
     function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -963,6 +1052,40 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         })()
         messagesInflight.set(sid, p)
         return p
+    }
+
+    const NO_PENDING_QUESTIONS: ReadonlySet<string> = new Set()
+
+    /**
+     * Sessions with a question waiting for the user (`question` tool). A
+     * pending question suspends the turn: the session reports idle with open
+     * todos, which every recovery path misreads as a hang. Fails open —
+     * without the question API (older OpenCode) or on error, recovery
+     * proceeds as before.
+     */
+    async function fetchPendingQuestionSessionIds(): Promise<ReadonlySet<string>> {
+        try {
+            const questionClient = (ctx.client as unknown as {
+                question?: { list?: () => Promise<unknown> }
+            }).question
+            const listQuestions = questionClient?.list
+            if (typeof listQuestions !== "function") return NO_PENDING_QUESTIONS
+            const response = await listQuestions.call(questionClient)
+            const requests = extractMessages((response ?? {}) as Record<string, unknown>)
+            const ids = new Set<string>()
+            for (const request of requests) {
+                const sid = (request as { sessionID?: unknown }).sessionID
+                if (typeof sid === "string" && sid) ids.add(sid)
+            }
+            return ids
+        } catch (err) {
+            dbg(`question.list() failed, assuming no pending questions: ${err instanceof Error ? err.message : String(err)}`)
+            return NO_PENDING_QUESTIONS
+        }
+    }
+
+    async function isQuestionPending(sid: string): Promise<boolean> {
+        return (await fetchPendingQuestionSessionIds()).has(sid)
     }
 
     function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
@@ -993,6 +1116,35 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         return false
     }
 
+    /**
+     * True when the newest assistant message signals "waiting for user
+     * input" (ends with a question mark or contains a waiting marker).
+     * Sibling of the pending-question guard: that one covers questions asked
+     * via the `question` tool, this one covers plain-text questions and
+     * confirmation requests. Fails open on errors.
+     */
+    async function lastAssistantWaitsForUserInput(sid: string): Promise<boolean> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                let text = ""
+                for (const part of parts) {
+                    if (part.type === "text") {
+                        text += (part.text as string) ?? ""
+                    }
+                }
+                return textWaitsForUserInput(text)
+            }
+        } catch {
+            // on error, don't block continue
+        }
+        return false
+    }
+
     async function getSessionStatusMap(): Promise<Record<string, string>> {
         try {
             const response = await ctx.client.session.status()
@@ -1014,6 +1166,115 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("debug", `session.status() failed: ${errMsg}`)
             return {}
         }
+    }
+
+    function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+            p.then(
+                (v) => { clearTimeout(t); resolve(v) },
+                (e) => { clearTimeout(t); reject(e) },
+            )
+        })
+    }
+
+    type SessionInfoResult =
+        | { kind: "info"; info: Record<string, any> }
+        | { kind: "missing" }
+        | { kind: "unknown" }
+
+    async function fetchSessionInfo(sid: string): Promise<SessionInfoResult> {
+        try {
+            const response = await ctx.client.session.get({ path: { id: sid } })
+            const raw = (response ?? {}) as Record<string, any>
+            if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+                const status = raw.response?.status
+                return status === 404 || status === undefined ? { kind: "missing" } : { kind: "unknown" }
+            }
+            const data = raw?.data ?? raw
+            if (data && typeof data === "object" && typeof data.id === "string") {
+                return { kind: "info", info: data }
+            }
+            return { kind: "unknown" }
+        } catch {
+            return { kind: "unknown" }
+        }
+    }
+
+    async function lookupSessionExists(sid: string): Promise<"exists" | "missing" | "unknown"> {
+        try {
+            const result = await withTimeout(fetchSessionInfo(sid), staleTaskGuardTimeoutMs, `session.get(${short(sid)})`)
+            if (result.kind === "info") return "exists"
+            if (result.kind === "missing") return "missing"
+            return "unknown"
+        } catch {
+            return "unknown"
+        }
+    }
+
+    async function guardStaleTaskId(parentSid: string, args: Record<string, unknown>): Promise<void> {
+        const taskId = args.task_id
+        if (typeof taskId !== "string" || taskId.length === 0) return
+        const lookup = await lookupSessionExists(taskId)
+        if (lookup !== "missing") {
+            if (lookup === "unknown") {
+                dbg(`Stale task guard on ${short(parentSid)}: session.get(${short(taskId)}) inconclusive, leaving args untouched`)
+            }
+            return
+        }
+        delete args.task_id
+        if (typeof args.prompt === "string") {
+            args.prompt = `${args.prompt}\n\n${STALE_TASK_NOTE}`
+        }
+        await log(
+            "info",
+            `Stale task_id ${short(taskId)} on ${short(parentSid)}: session missing from storage; dropping task_id, continuing with a fresh subagent session`,
+        )
+    }
+
+    const bgSnapshotsDone = new Set<string>()
+
+    async function snapshotBgResult(sid: string): Promise<void> {
+        if (!bgSnapshotEnabled || bgSnapshotsDone.has(sid)) return
+        try {
+            const parentID = await sessionParentID(sid)
+            if (!parentID) {
+                bgSnapshotsDone.add(sid)
+                return
+            }
+            const msgs = await getSessionMessages(sid)
+            let text = ""
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (parts) {
+                    for (const part of parts) {
+                        if (part.type === "text") text += (part.text as string) ?? ""
+                    }
+                }
+                break
+            }
+            text = text.trim()
+            if (!text) return
+            await mkdir(bgSnapshotDir, { recursive: true })
+            const target = join(bgSnapshotDir, `${sid}.txt`)
+            const tmp = join(bgSnapshotDir, `.${sid}.tmp`)
+            await writeFile(tmp, text, "utf8")
+            await rename(tmp, target)
+            bgSnapshotsDone.add(sid)
+            await log("info", `Bg result snapshot saved for ${short(sid)}`)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            dbg(`bg result snapshot failed for ${short(sid)}: ${errMsg}`)
+        }
+    }
+
+    async function sessionParentID(sid: string): Promise<string | null> {
+        const result = await fetchSessionInfo(sid)
+        if (result.kind !== "info") return null
+        const parentID = result.info.parentID
+        return typeof parentID === "string" && parentID.length > 0 ? parentID : null
     }
 
     // In-memory cache + inflight dedup to avoid concurrent SQLite reads
@@ -1412,7 +1673,9 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         }
                     }
 
-                    if (containsReadyToContinuePattern(text)) {
+                    // Reasoning is internal monologue, not a claim to the user —
+                    // done/continue heuristics scan visible text only.
+                    if (!isReasoning && containsReadyToContinuePattern(text)) {
                         // Check if todos exist and are all completed/cancelled
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(isOpenTodo)
@@ -1452,7 +1715,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     
                     // Also trigger on done-claim patterns even without "ready to continue" text
                     // This catches cases where model says "task completed" but doesn't use 🎉 or tool_call
-                    if (!bestCandidate && containsDoneClaimPattern(text)) {
+                    if (!isReasoning && doneClaimNudgeEnabled && !bestCandidate && containsDoneClaimPattern(text)) {
                         const todos = w.todos || []
                         const hasOpenTodos = todos.some(isOpenTodo)
                         
@@ -1464,11 +1727,15 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                             priority: 1,
                         }
                     } else if (w.doneClaimNoTodosAttempts < maxRetries) {
-                        await log("info", `${short(sid)} - model claims done with no open todos. Sending details prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
-                        bestCandidate = {
-                            prompt: doneWithoutDetailsPrompt,
-                            source: "done-claim-no-todos",
-                            priority: 1,
+                        if (containsWorkDescription(text)) {
+                            await log("info", `${short(sid)} - done claim comes with a work description, skipping details prompt`)
+                        } else {
+                            await log("info", `${short(sid)} - model claims done with no open todos. Sending details prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
+                            bestCandidate = {
+                                prompt: doneWithoutDetailsPrompt,
+                                source: "done-claim-no-todos",
+                                priority: 1,
+                            }
                         }
                     }
                     }
@@ -1516,12 +1783,18 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const hasOpenTodos = todos.some(isOpenTodo)
                 
                 if (hasOpenTodos && busyCount() === 0) {
-                    const reminder = buildOpenTodosReminder(todos)
-                    await log("info", `${short(sid)} - no activity detected but todos remain open (${getOpenTodos(todos).length} tasks). Sending reminder...`)
-                    bestCandidate = {
-                        prompt: reminder,
-                        source: "idle-with-open-todos-reminder",
-                        priority: 2,
+                    if (!openTodosNudgeEnabled) {
+                        dbg(`${short(sid)} - open-todos reminder disabled via openTodosNudge option`)
+                    } else if (await lastAssistantWaitsForUserInput(sid)) {
+                        await log("info", `${short(sid)} - skipping open-todos reminder: assistant appears to be waiting for user input`)
+                    } else {
+                        const reminder = buildOpenTodosReminder(todos)
+                        await log("info", `${short(sid)} - no activity detected but todos remain open (${getOpenTodos(todos).length} tasks). Sending reminder...`)
+                        bestCandidate = {
+                            prompt: reminder,
+                            source: "idle-with-open-todos-reminder",
+                            priority: 2,
+                        }
                     }
                 } else if (hasOpenTodos && busyCount() > 0) {
                     await log("debug", `${short(sid)} - todos remain open but ${busyCount()} sessions busy (subagents running), skipping continue`)
@@ -1573,9 +1846,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 await tryAbortAndResume(sid, w)
             } else {
                 try {
-                    await sendContinuePrompt(sid, bestCandidate.prompt, w)
-                    if (isOpenTodosReminder) w.todoNudgeAttempts++
-                    await log("info", `${short(sid)} - ${bestCandidate.source} recovery sent (attempt ${w.toolTextAttempts})`)
+                    const sent = await sendContinuePrompt(sid, bestCandidate.prompt, w)
+                    if (sent) {
+                        if (isOpenTodosReminder) w.todoNudgeAttempts++
+                        await log("info", `${short(sid)} - ${bestCandidate.source} recovery sent (attempt ${w.toolTextAttempts})`)
+                    } else {
+                        dbg(`${short(sid)} - ${bestCandidate.source} suppressed (pending user input)`)
+                    }
                 } catch (err) {
                     const errMsg = err instanceof Error ? err.message : String(err)
                     await log("warn", `${short(sid)} - ${bestCandidate.source} recovery failed: ${errMsg}`)
@@ -1600,8 +1877,12 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         }
         if (w.userCancelled || w.completionSignaled) return false
         if (w.aborting) return false
-        if (w.usageLimit) {
-            dbg(`Abort suppressed on ${short(sid)}: usage limit wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Abort suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
+            return false
+        }
+        if (await isQuestionPending(sid)) {
+            dbg(`Abort suppressed on ${short(sid)}: user question pending (abort would kill the pending question)`)
             return false
         }
 
@@ -1784,6 +2065,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
     }
 
     function clearUsageLimit(w: SessionWatch, sid: string, reason: string): void {
+        w.usageLimitPending = false
         if (!w.usageLimit) return
         if (w.usageLimit.timer) clearTimeout(w.usageLimit.timer)
         w.usageLimit = null
@@ -1801,6 +2083,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         rechecks: number,
     ): Promise<void> {
         if (w.usageLimit?.timer) clearTimeout(w.usageLimit.timer)
+        w.usageLimitPending = false
         const now = Date.now()
         const cappedResumeAt = Math.min(
             Math.max(resumeAtMs, now + 1_000),
@@ -1948,7 +2231,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         clearUsageLimit(w, sid, "limit reset")
         await log("info", `${short(sid)} - usage limit reset, resuming`)
         try {
-            await sendContinuePrompt(sid, continuePrompt, w)
+            const resumeText = resumeNoteEnabled ? `${continuePrompt}\n\n${resumeNoteText}` : continuePrompt
+            await sendContinuePrompt(sid, resumeText, w)
         } catch (err) {
             const errMsg = err instanceof Error ? err.message : String(err)
             await log("warn", `${short(sid)} - resume after usage limit failed: ${errMsg}`)
@@ -1973,34 +2257,51 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             if (errorId) w.lastUsageLimitErrorId = errorId
             return "handled"
         }
-        const providerInfo = await getSessionProviderModel(sid)
-        const providerID = providerInfo.providerID
-        const modelID = providerInfo.modelID
-        const provider = (providerID ?? "").toLowerCase()
-        if (!provider) {
+        if (w.usageLimitPending) {
+            dbg(`Usage-limit signal on ${short(sid)} suppressed: probe already in flight`)
+            return "handled"
+        }
+        // Mark the wait as pending SYNCHRONOUSLY, before any await: probing the
+        // usage endpoint takes hundreds of ms, and stall-recovery paths
+        // (idle open-todos nudge, abort+resume) consult w.usageLimit between
+        // detection and arming. Without this flag they send prompts straight
+        // into the rate-limited API.
+        w.usageLimitPending = true
+        try {
+            const providerInfo = await getSessionProviderModel(sid)
+            const providerID = providerInfo.providerID
+            const modelID = providerInfo.modelID
+            const provider = (providerID ?? "").toLowerCase()
+            if (!provider) {
+                await log(
+                    "info",
+                    `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`,
+                )
+                return "ignored"
+            }
+            if (!usageLimitProviders.includes(provider)) {
+                await log(
+                    "info",
+                    `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` +
+                        `usageLimitProviders (${usageLimitProviders.join(", ")})`,
+                )
+                return "ignored"
+            }
             await log(
                 "info",
-                `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`,
+                `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` +
+                    `${truncateForLog(errorMessage)}; querying Codex usage endpoint`,
             )
-            return "ignored"
+            if (errorId) w.lastUsageLimitErrorId = errorId
+            const probe = await probeUsageLimits(modelID)
+            await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
+            return "handled"
+        } finally {
+            // The wait either got armed (armUsageLimitResume resets the flag)
+            // or nothing was armed — never leave a stale pending marker that
+            // would suppress future recovery.
+            if (!w.usageLimit) w.usageLimitPending = false
         }
-        if (!usageLimitProviders.includes(provider)) {
-            await log(
-                "info",
-                `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` +
-                    `usageLimitProviders (${usageLimitProviders.join(", ")})`,
-            )
-            return "ignored"
-        }
-        await log(
-            "info",
-            `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` +
-                `${truncateForLog(errorMessage)}; querying Codex usage endpoint`,
-        )
-        if (errorId) w.lastUsageLimitErrorId = errorId
-        const probe = await probeUsageLimits(modelID)
-        await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
-        return "handled"
     }
 
     function truncateForLog(text: string, limit = 200): string {
@@ -2017,8 +2318,8 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             await log("warn", `tryResume called with invalid sid: ${sid}`)
             return false
         }
-        if (w.usageLimit) {
-            dbg(`Resume suppressed on ${short(sid)}: usage limit wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Resume suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
             return false
         }
         const now = Date.now()
@@ -2048,7 +2349,13 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
         await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
 
         try {
-            await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
+            const sent = await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
+            if (!sent) {
+                // Suppressed (e.g. a user question is pending) — not an attempt.
+                w.resumeAttempts--
+                dbg(`tryResume on ${short(sid)}: prompt suppressed, attempt not counted`)
+                return false
+            }
             await log("info", `${short(sid)} - retry sent`)
             return true
         } catch (err) {
@@ -2253,6 +2560,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     !w.continuing &&
                     !w.gaveUp &&
                     !w.usageLimit &&
+                    !w.usageLimitPending &&
                     // recoveryAttempts === 0: the watchdog chain owns the
                     // counter once the first recovery send is initiated (WP-05)
                     w.recoveryAttempts === 0
@@ -2296,9 +2604,17 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                 const open = getOpenTodos(w.todos || [])
                 if (open.length === 0) continue
                 if (w.todoNudgeAttempts >= maxRetries) continue
+                if (!openTodosNudgeEnabled) {
+                    dbg(`${short(sid)} - idle todo nudge disabled via openTodosNudge option`)
+                    continue
+                }
                 const elapsedSinceLastNudge = Date.now() - w.lastRetryAt
                 const requiredBackoff = backoffMs(w.todoNudgeAttempts, baseBackoffMs, maxBackoffMs)
                 if (w.lastRetryAt > 0 && elapsedSinceLastNudge < requiredBackoff) continue
+                if (await lastAssistantWaitsForUserInput(sid)) {
+                    await log("info", `${short(sid)} - skipping idle todo nudge: assistant appears to be waiting for user input`)
+                    continue
+                }
                 const isCelebration = await lastAssistantEndsWithCelebration(sid)
                 if (isCelebration) {
                     const openCount = getOpenTodos(w.todos || []).length
@@ -2391,13 +2707,14 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                     log("debug", `${short(sid)} -> idle (${currentBusy})`)
 
                     if (!w.isSubagent) {
-                        if (
-                            !w.pendingRecovery &&
-                            !w.completionSignaled &&
-                            !w.userCancelled &&
-                            !w.aborting &&
-                            !w.usageLimit
-                        ) {
+                    if (
+                        !w.pendingRecovery &&
+                        !w.completionSignaled &&
+                        !w.userCancelled &&
+                        !w.aborting &&
+                        !w.usageLimit &&
+                        !w.usageLimitPending
+                    ) {
                             try {
                                 const errInfo = getLastAssistantError(
                                     await getSessionMessages(sid),
@@ -2508,18 +2825,24 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
                         const open = getOpenTodos(todos)
                         
                         if (open.length > 0 && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
-                            const isCelebration = await lastAssistantEndsWithCelebration(sid)
-                            await log("info", `${short(sid)} - open todos=${open.length}, isCelebration=${isCelebration}, currentBusy=${currentBusy}`)
-                            if (isCelebration) {
-                                // 🎉 with open todos is a FALSE POSITIVE - don't latch completionSignaled, send nudge
-                                await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
-                                const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
-                                w.todoNudgeAttempts++
+                            if (!openTodosNudgeEnabled) {
+                                dbg(`session.idle sid=${short(sid)}: open-todos nudge disabled via openTodosNudge option`)
+                            } else if (await lastAssistantWaitsForUserInput(sid)) {
+                                await log("info", `${short(sid)} - skipping open-todos nudge: assistant appears to be waiting for user input`)
                             } else {
-                                const reminder = buildOpenTodosReminder(todos)
-                                await tryResume(sid, w, "Idle with open todos", reminder)
-                                w.todoNudgeAttempts++
+                                const isCelebration = await lastAssistantEndsWithCelebration(sid)
+                                await log("info", `${short(sid)} - open todos=${open.length}, isCelebration=${isCelebration}, currentBusy=${currentBusy}`)
+                                if (isCelebration) {
+                                    // 🎉 with open todos is a FALSE POSITIVE - don't latch completionSignaled, send nudge
+                                    await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
+                                    const reminder = buildOpenTodosReminder(todos)
+                                    const sent = await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
+                                    if (sent) w.todoNudgeAttempts++
+                                } else {
+                                    const reminder = buildOpenTodosReminder(todos)
+                                    const sent = await tryResume(sid, w, "Idle with open todos", reminder)
+                                    if (sent) w.todoNudgeAttempts++
+                                }
                             }
                         }
                     }
@@ -2584,6 +2907,7 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
 
             case "session.idle": {
                 if (!sid) break
+                void snapshotBgResult(sid)
                 const w = sessions.get(sid)
                 if (w) {
                     w.status = "idle"
@@ -2814,11 +3138,19 @@ export const AutoResumePlugin: Plugin = async (ctx, options) => {
             }
         },
 
-        "tool.execute.before": async (input) => {
+        "tool.execute.before": async (input, output) => {
             if (!input?.sessionID) return
             const w = ensureWatch(input.sessionID)
             w.pendingTools++
             w.lastActivityAt = Date.now()
+            if (
+                staleTaskGuardEnabled &&
+                input.tool === "task" &&
+                output?.args &&
+                typeof output.args === "object"
+            ) {
+                await guardStaleTaskId(input.sessionID, output.args as Record<string, unknown>)
+            }
         },
 
         "command.execute.before": async (input) => {

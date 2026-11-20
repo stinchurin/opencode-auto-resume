@@ -206,6 +206,22 @@ _Motivated by:_
 
 ---
 
+### Pending-question guard
+
+When the agent asks the user a question via the built-in `question` tool, OpenCode suspends the turn: the session goes idle with open todos, which every idle-boundary recovery path misreads as a hang. Before **any** resume prompt (`sendContinuePrompt`) and before any abort escalation, the plugin queries the OpenCode question API (`question.list()`) and backs off for sessions with a pending question. While the question is unanswered, todo nudges, stall continues, action-intent nudges, done-claim checks and abort escalations stay silent — and suppressed prompts do not consume the retry budget. After the user answers, normal recovery resumes. The check fails open: on OpenCode builds without the question API, or if the call errors, recovery behaves exactly as before.
+
+_Motivated by:_ agents asking the user a clarifying question were resumed seconds later by the todo nudge — the model answered its own question and kept working without the user's input.
+
+---
+
+### Plain-text waiting-for-input guard
+
+The pending-question guard above only covers questions asked through the `question` tool. Agents also end turns with plain-text questions and confirmation requests ("Какой вариант предпочитаете: A или B?", "Ответьте в любом формате…", "Waiting for your confirmation") while todos stay open. On such idle boundaries, the open-todos reminder (`You have N unfinished tasks… Please continue working on these tasks`) is suppressed: the newest assistant message ending with a question mark, or containing a waiting-for-input marker (RU + EN), signals an intentional pause — not a stall. Suppressed reminders do not consume the retry budget, and the reminder fires normally once the turn resumes with a non-question assistant message.
+
+Disable the open-todos reminder entirely with the `openTodosNudge: false` option.
+
+---
+
 ### Model, agent & provider preservation
 
 When resuming with `"continue"`, the plugin extracts agent, model, and provider from the last session message — falling back to `msg.info.agent` / `msg.info.model` if the top-level field is missing. This preserves the user's UI selection across resumes instead of reverting to the default agent.
@@ -259,6 +275,12 @@ When the assistant ends a line with `:` ("Next, I will edit the file:") — anno
 ### Done-claim verification
 
 If the assistant claims the task is done ("task done", "finished", "all complete") but open todos remain, the plugin sends `DONE_WITHOUT_WORK_PROMPT` asking the agent to verify and finish remaining work. If it claims done with **no** open todos but the response contains no description of the work, the plugin sends `DONE_WITHOUT_DETAILS_PROMPT` — an imperative prompt demanding a concrete report (files changed, commands run, results). Both use the real `todo.updated` event state — not regex on the message text.
+
+Three guards keep this path from scolding legitimate answers:
+
+- **Reasoning is excluded.** Done-claim and ready-to-continue patterns are matched against visible text parts only; `reasoning` (thinking) parts never count as a claim to the user.
+- **A report suppresses the report demand.** Before sending `DONE_WITHOUT_DETAILS_PROMPT`, the matched response is checked for a work description — file paths, code spans, commands, `N/M` results, or 400+ characters. A detailed answer that merely ends with "задача полностью выполнена." is left alone.
+- **`doneClaimNudge: false`** disables both done-claim prompts entirely.
 
 ---
 
@@ -413,6 +435,8 @@ With options:
 | `warmupMs` | `15000` | Action-intent detection disabled while a session is younger than this |
 | `debug` | `false` | Enable `[debug]` console diagnostics |
 | `resumeOnActionIntent` | `true` | Enable action-intent (`:`-terminated line) nudges |
+| `openTodosNudge` | `true` | Enable the idle-with-open-todos reminder; auto-suppressed while the newest assistant message looks like a question / confirmation request |
+| `doneClaimNudge` | `true` | Enable done-claim verification prompts; visible text only (reasoning excluded), and a response that already contains a work description is never asked for a report |
 | `continuePrompt` | `"continue"` | Prompt text for stall/streaming/dead-stream recovery |
 | `actionIntentPrompt` | same as `continuePrompt` | Prompt sent on action-intent detection |
 | `toolTextRecoveryPrompt` | `TOOL_TEXT_RECOVERY_PROMPT` | Override the tool-call-as-text recovery prompt |

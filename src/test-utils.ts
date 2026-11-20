@@ -168,3 +168,37 @@ export function buildOpenTodosReminder(todos: Todo[]): string {
     const thisWord = open.length > 1 ? "these" : "this"
     return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
 }
+
+const WAITING_FOR_INPUT_MARKERS: RegExp[] = [
+    /жд(?:ут|у|ёт|ет|ем|ём)\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений)/i,
+    /ожидает\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений|ввода)/i,
+    /(?<![\p{L}\p{N}_])подтвердите(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])ответьте(?![\p{L}\p{N}_])/iu,
+    /waiting\s+for\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /await(?:s|ing)\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /please\s+(?:confirm|answer|reply)/i,
+]
+
+export function textWaitsForUserInput(text: string): boolean {
+    if (!text) return false
+    const cleaned = text.replace(/```[\s\S]*?```/g, " ").trim()
+    if (!cleaned) return false
+    const lastLine = cleaned.split("\n").reverse().find(l => l.trim().length > 0)?.trim() ?? ""
+    if (/\?[\s)\]>*_~"'»]*$/.test(lastLine)) return true
+    return WAITING_FOR_INPUT_MARKERS.some(re => re.test(cleaned))
+}
+
+const WORK_REPORT_MIN_LENGTH = 400
+
+const WORK_REPORT_SIGNAL_PATTERNS = [
+    /`[^`\n]+`/,
+    /[\w.@~-]+\/[\w.@~-]+/,
+    /\b(?:bun|npm|npx|node|git|mvn|gradle|pytest|cargo|make)\s+\S+/i,
+    /\b\d+\s*\/\s*\d+\b/,
+]
+
+export function containsWorkDescription(text: string): boolean {
+    const trimmed = text.trim()
+    if (trimmed.length >= WORK_REPORT_MIN_LENGTH) return true
+    return WORK_REPORT_SIGNAL_PATTERNS.some((pat) => pat.test(trimmed))
+}
