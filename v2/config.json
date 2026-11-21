@@ -1,0 +1,6 @@
+{
+  "usageLimitEnabled": true,
+  "usageLimitProviders": ["openai"],
+  "usageLimitScript": "/Users/sergejtincurin/.local/bin/codex-limits",
+  "logFile": "/Users/sergejtincurin/.local/state/opencode/auto-resume.log"
+}

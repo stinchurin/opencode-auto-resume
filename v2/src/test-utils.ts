@@ -1,0 +1,204 @@
+/**
+ * Pure utility functions used by tests.
+ *
+ * These MUST NOT be exported from src/index.ts in the production bundle.
+ * OpenCode's plugin loader iterates every module export and treats each as a
+ * Plugin entrypoint. Non-Plugin functions that return non-Hooks values
+ * (especially `null`) cause a host crash: `null.config?.(U)` throws
+ * "null is not an object (evaluating 'N.config')".
+ *
+ * Signatures mirror the private definitions in src/index.ts so tests exercise
+ * the same logic. If a function's signature changes in index.ts, update it
+ * here too.
+ */
+
+export interface Todo {
+    content: string
+    status: "pending" | "in_progress" | "completed" | "cancelled"
+    priority: "high" | "medium" | "low"
+}
+
+export interface SessionWatch {
+    createdAt: number
+    lastActivityAt: number
+    status: "busy" | "idle" | "retry" | "unknown"
+    userCancelled: boolean
+    resumeAttempts: number
+    lastRetryAt: number
+    gaveUp: boolean
+    orphanWatchStartAt: number | null
+    aborting: boolean
+    toolTextRecovered: boolean
+    toolTextAttempts: number
+    continueTimestamps: number[]
+    idleSince: number | null
+    continuing: boolean
+    todos: Todo[]
+    todoCheckAttempts: number
+    toolTextTimer: ReturnType<typeof setTimeout> | null
+    checkingToolText: boolean
+    lastSubagentCheckAt: number
+    interruptedContinueCount: number
+    recentToolCalls: Array<{ toolName: string; at: number }>
+    toolLoopAttempts: number
+    isSubagent: boolean
+    completionSignaled: boolean
+    todoNudgeAttempts: number
+    taskCompleteOverrides: number
+    doneClaimNoTodosAttempts: number
+    pendingTools: number
+    pendingCommands: number
+    pendingRecovery: boolean
+    pendingRecoveryReason: string | null
+    pendingRecoveryAt: number
+    recoveryAttempts: number
+    watchdogRetryGuard: boolean
+}
+
+const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
+    "ProviderError",
+    "APIError",
+    "StreamError",
+    "ConnectionError",
+    "TimeoutError",
+]
+
+const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
+    "streaming response failed",
+    "stream.*fail",
+    "connection.*reset",
+    "connection.*closed",
+]
+
+const DEFAULT_MAX_BACKOFF_MS = 8_000
+const DEFAULT_BASE_BACKOFF_MS = 1_000
+
+export function isStreamingFailure(
+    errorName: string,
+    errorMessage: string,
+    errorNames: string[] = DEFAULT_STREAMING_FAILURE_ERROR_NAMES,
+    messagePatterns: string[] = DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+): boolean {
+    if (!errorName && !errorMessage) return false
+
+    if (errorName && errorNames.includes(errorName)) {
+        return true
+    }
+
+    if (errorMessage) {
+        const lowerMessage = errorMessage.toLowerCase()
+        for (const pattern of messagePatterns) {
+            try {
+                if (new RegExp(pattern, "i").test(lowerMessage)) return true
+            } catch {
+                if (lowerMessage.includes(pattern.toLowerCase())) return true
+            }
+        }
+    }
+
+    return false
+}
+
+export function getLastAssistantError(
+    messages: Array<Record<string, unknown>>,
+): { name: string; message: string; id: string | null } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        const role =
+            (msg.role as string) ??
+            ((msg.info as Record<string, unknown> | undefined)?.role as string)
+        if (role !== "assistant") continue
+
+        const info = msg.info as Record<string, unknown> | undefined
+        const id =
+            (msg.id as string | undefined) ??
+            (info?.id as string | undefined) ??
+            null
+        const err =
+            (msg.error as Record<string, unknown> | undefined) ??
+            (info?.error as Record<string, unknown> | undefined)
+        if (err) {
+            const data = err.data as Record<string, unknown> | undefined
+            const name = (err.name as string) ?? ""
+            const message =
+                (data?.message as string) ?? (err.message as string) ?? ""
+            return { name, message, id }
+        }
+
+        const parts = msg.parts as Array<Record<string, unknown>> | undefined
+        if (parts) {
+            for (let j = parts.length - 1; j >= 0; j--) {
+                const part = parts[j]
+                if (part.type !== "retry") continue
+                const partErr = part.error as
+                    | Record<string, unknown>
+                    | undefined
+                if (!partErr) continue
+                const data = partErr.data as
+                    | Record<string, unknown>
+                    | undefined
+                const name = (partErr.name as string) ?? ""
+                const message =
+                    (data?.message as string) ??
+                    (partErr.message as string) ??
+                    ""
+                return { name, message, id }
+            }
+        }
+        return null
+    }
+    return null
+}
+
+export function backoffMs(
+    attempt: number,
+    baseBackoffMs: number = DEFAULT_BASE_BACKOFF_MS,
+    maxBackoffMs: number = DEFAULT_MAX_BACKOFF_MS,
+): number {
+    return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
+}
+
+export function buildOpenTodosReminder(todos: Todo[]): string {
+    if (!Array.isArray(todos) || todos.length === 0) return "continue"
+    const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
+    if (open.length === 0) return "continue"
+    const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
+    const plural = open.length > 1 ? "s" : ""
+    const taskWord = open.length > 1 ? "tasks" : "task"
+    const thisWord = open.length > 1 ? "these" : "this"
+    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+}
+
+const WAITING_FOR_INPUT_MARKERS: RegExp[] = [
+    /жд(?:ут|у|ёт|ет|ем|ём)\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений)/i,
+    /ожидает\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений|ввода)/i,
+    /(?<![\p{L}\p{N}_])подтвердите(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])ответьте(?![\p{L}\p{N}_])/iu,
+    /waiting\s+for\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /await(?:s|ing)\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /please\s+(?:confirm|answer|reply)/i,
+]
+
+export function textWaitsForUserInput(text: string): boolean {
+    if (!text) return false
+    const cleaned = text.replace(/```[\s\S]*?```/g, " ").trim()
+    if (!cleaned) return false
+    const lastLine = cleaned.split("\n").reverse().find(l => l.trim().length > 0)?.trim() ?? ""
+    if (/\?[\s)\]>*_~"'»]*$/.test(lastLine)) return true
+    return WAITING_FOR_INPUT_MARKERS.some(re => re.test(cleaned))
+}
+
+const WORK_REPORT_MIN_LENGTH = 400
+
+const WORK_REPORT_SIGNAL_PATTERNS = [
+    /`[^`\n]+`/,
+    /[\w.@~-]+\/[\w.@~-]+/,
+    /\b(?:bun|npm|npx|node|git|mvn|gradle|pytest|cargo|make)\s+\S+/i,
+    /\b\d+\s*\/\s*\d+\b/,
+]
+
+export function containsWorkDescription(text: string): boolean {
+    const trimmed = text.trim()
+    if (trimmed.length >= WORK_REPORT_MIN_LENGTH) return true
+    return WORK_REPORT_SIGNAL_PATTERNS.some((pat) => pat.test(trimmed))
+}

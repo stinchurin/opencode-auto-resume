@@ -1,0 +1,13 @@
+{
+  "usageLimitProviders": ["lanit"],
+  "usageLimitScript": "/Users/sergejtincurin/.local/share/opencode-v2-migration/stage/auto-resume/probe/fake-limits-stateful.sh",
+  "usageLimitRecheckMs": 2000,
+  "usageLimitMaxRechecks": 6,
+  "usageLimitMaxWaitMs": 60000,
+  "chunkTimeoutMs": 600000,
+  "checkIntervalMs": 1000,
+  "loopMaxContinues": 10,
+  "maxRetries": 2,
+  "logFile": "/Users/sergejtincurin/.local/share/opencode-v2-migration/tmp/auto-resume.log",
+  "debug": true
+}

@@ -1,0 +1,3172 @@
+/**
+ * OpenCode Auto-Resume Plugin
+ * Detects when an LLM session stalls mid-stream and automatically sends a continuation prompt.
+ */
+
+import type { Plugin } from "@opencode-ai/plugin"
+import { tool } from "@opencode-ai/plugin"
+import type { SessionPromptResponses } from "@opencode-ai/sdk"
+import { execFile } from "node:child_process"
+import { mkdir, rename, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+import {
+    evaluateCodexLimits,
+    formatDuration,
+    formatLocalTime,
+    matchesUsageLimitMessage,
+    DEFAULT_USAGE_LIMIT_MESSAGE_PATTERNS,
+} from "./codex-limits"
+
+interface Todo {
+    content: string
+    status: "pending" | "in_progress" | "completed" | "cancelled"
+    priority: "high" | "medium" | "low"
+}
+
+interface ToolCallRecord {
+    toolName: string
+    at: number
+}
+
+/**
+ * Armed wait for a ChatGPT/Codex subscription limit reset: while present, all
+ * other recovery paths are suppressed, because retrying before the window
+ * resets only burns attempts and reproduces the same error.
+ */
+export interface UsageLimitWait {
+    resumeAtMs: number
+    resetAtMs: number | null
+    decidingWindow: string | null
+    providerID: string | null
+    modelID: string | null
+    rechecks: number
+    timer: ReturnType<typeof setTimeout> | null
+}
+
+export interface UsageLimitProbe {
+    ok: boolean
+    limitReached: boolean
+    resetAtMs: number | null
+    resumeAtMs: number | null
+    decidingWindow: string | null
+    graceMs: number
+    reason?: string
+    message?: string
+}
+
+export interface SessionWatch {
+    createdAt: number
+    lastActivityAt: number
+    status: "busy" | "idle" | "retry" | "unknown"
+    userCancelled: boolean
+    resumeAttempts: number
+    lastRetryAt: number
+    gaveUp: boolean
+    orphanWatchStartAt: number | null
+    aborting: boolean
+    pluginAbortInFlight: boolean
+    toolTextRecovered: boolean
+    toolTextAttempts: number
+    continueTimestamps: number[]
+    idleSince: number | null
+    continuing: boolean
+    todos: Todo[]
+    todoCheckAttempts: number
+    toolTextTimer: ReturnType<typeof setTimeout> | null
+    checkingToolText: boolean
+    lastSubagentCheckAt: number
+    interruptedContinueCount: number
+    recentToolCalls: ToolCallRecord[]
+    toolLoopAttempts: number
+    isSubagent: boolean
+    completionSignaled: boolean
+    todoNudgeAttempts: number
+    taskCompleteOverrides: number
+    doneClaimNoTodosAttempts: number
+    pendingTools: number
+    pendingCommands: number
+    pendingRecovery: boolean
+    pendingRecoveryReason: string | null
+    pendingRecoveryAt: number
+    recoveryAttempts: number
+    watchdogRetryGuard: boolean
+    usageLimit: UsageLimitWait | null
+    usageLimitPending: boolean
+    lastUsageLimitErrorId: string | null
+}
+
+const DEFAULT_CHUNK_TIMEOUT_MS = 45_000
+const DEFAULT_CHECK_INTERVAL_MS = 5_000
+const DEFAULT_GRACE_PERIOD_MS = 3_000
+const DEFAULT_MAX_RETRIES = 3
+const DEFAULT_MAX_BACKOFF_MS = 8_000
+const DEFAULT_BASE_BACKOFF_MS = 1_000
+const DEFAULT_SUBAGENT_WAIT_MS = 15_000
+const ABORT_CONTINUE_DELAY_MS = 2_000
+const DEFAULT_LOOP_MAX_CONTINUES = 3
+const DEFAULT_LOOP_WINDOW_MS = 10 * 60_000
+const DEFAULT_TOOL_TEXT_CHECK_DELAY_MS = 3_000
+const DEFAULT_MAX_RECOVERY_RETRIES = 2
+const DEFAULT_MIN_ACTIVITY_GAP_MS = 1_000
+const DEFAULT_WARMUP_MS = 15_000
+const DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS = 200
+const DEFAULT_DEBUG = false
+const DEFAULT_USAGE_LIMIT_ENABLED = true
+const DEFAULT_USAGE_LIMIT_PROVIDERS = ["openai"]
+const DEFAULT_USAGE_LIMIT_GRACE_MS = 60_000
+const DEFAULT_USAGE_LIMIT_TIMEOUT_MS = 10_000
+const DEFAULT_USAGE_LIMIT_RECHECK_MS = 10 * 60_000
+const DEFAULT_USAGE_LIMIT_MAX_RECHECKS = 6
+const DEFAULT_USAGE_LIMIT_MAX_WAIT_MS = 8 * 24 * 60 * 60_000
+const MAX_TIMER_DELAY_MS = 2_147_000_000
+
+const DEFAULT_STALE_TASK_GUARD_TIMEOUT_MS = 3_000
+const DEFAULT_BG_SNAPSHOT_DIR = join(homedir(), ".local", "share", "opencode", "bg-results")
+
+// Injected into a `task` call when its task_id points to a session that vanished
+// from storage (opencode loses session.created for background subagents).
+const STALE_TASK_NOTE =
+    "NOTE: The task_id you referenced points to a session that is no longer available in storage. " +
+    "Continue as a fresh subagent session: do not try to read or continue the old one, and " +
+    "reconstruct any needed context from your task description and the repository state."
+
+// Injected into the resume prompt after a usage-limit wait: long pauses can lose
+// background subagent sessions, so the model restarts them instead of blocking.
+const RESUME_AFTER_PAUSE_NOTE =
+    "NOTE: This session was resumed automatically after waiting out a provider usage-limit window. " +
+    "Long pauses can lose background subagent sessions from storage: if a task_id, background_output " +
+    "or session reference no longer resolves, do not block on it and do not excavate local storage — " +
+    "restart that subagent task fresh or re-derive the result from on-disk evidence, then continue the plan."
+
+const DEFAULT_STREAMING_FAILURE_ERROR_NAMES = [
+    "ProviderError",
+    "APIError",
+    "StreamError",
+    "ConnectionError",
+    "TimeoutError",
+]
+
+const DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS = [
+    "streaming response failed",
+    "stream.*fail",
+    "connection.*reset",
+    "connection.*closed",
+]
+
+const MAX_IDLE_SESSIONS = 50
+const IDLE_CLEANUP_MS = 10 * 60_000
+const SESSION_DISCOVERY_INTERVAL_MS = 60_000
+
+const TOOL_TEXT_RECOVERY_PROMPT =
+    "Your last message contained a raw tool call printed as text instead of being executed. " +
+    "Please use the proper tool calling mechanism to execute it."
+
+const THINKING_TOOL_RECOVERY_PROMPT =
+    "I noticed you have a tool call generated in your thinking/reasoning. " +
+    "Please execute it using the proper tool calling mechanism instead of keeping it in reasoning."
+
+const TOOL_LOOP_RECOVERY_PROMPT =
+    "I notice you've been calling the same tool multiple times in a row without making progress. " +
+    "Please step back and reassess your approach. Consider: " +
+    "1) Are you stuck in a loop? 2) Do you need different information first? " +
+    "3) Should you try a different tool or break the task into smaller steps? " +
+    "Take a moment to think about what's blocking you and propose a different strategy."
+
+const TOOL_TEXT_PATTERNS = [
+    /<function\s*=/i,
+    /<function>/i,
+    /<\/function>/i,
+    /<parameter\s*=/i,
+    /<parameter>/i,
+    /<\/parameter>/i,
+    /<tool_call[\s>]/i,
+    /<\/tool_call>/i,
+    /<tool[\s_]name\s*=/i,
+    /<invoke\s+/i,
+    /<func(?:t|ti|tio|tion)?$/im,
+    /<par(?:a|am|ame|amet|amete|ameter)?$/im,
+    /<(?:edit|write|read|bash|grep|glob|search|replace|execute|run)\s*(?:\s[^>]*)?\s*(?:\/>|>)/i,
+    /{"type":\s*"function"/i,
+    /{"name":\s*"[a-zA-Z_]/i,
+    /\{\s*"type"\s*:?$/im,
+    /\{\s*"name"\s*:?$/im,
+]
+
+const TRUNCATED_XML_PATTERNS = [
+    { open: /<function[^>]*>/i, close: /<\/function>/i },
+    { open: /<parameter[^>]*>/i, close: /<\/parameter>/i },
+    { open: /<tool_call[^>]*>/i, close: /<\/tool_call>/i },
+    { open: /\{\s*"type"\s*:/i, close: /}/ },
+    { open: /\{\s*"name"\s*:/i, close: /}/ },
+]
+
+const READY_TO_CONTINUE_PATTERNS = [
+    /ready to continue with task/i,
+    /continuing with task/i,
+    /continue with task/i,
+    /proceeding with task/i,
+    /ready to proceed with task/i,
+    /will continue with task/i,
+    /moving on to task/i,
+]
+
+function stripCodeBlocks(text: string): string {
+    return text
+        .replace(/```[\s\S]*?```/g, "")
+        .replace(/`[^`\n]+`/g, "")
+}
+
+function containsToolCallAsText(text: string): boolean {
+    if (text.length <= 10) return false
+    const stripped = stripCodeBlocks(text)
+    if (TOOL_TEXT_PATTERNS.some((pat) => pat.test(stripped))) return true
+    for (const { open, close } of TRUNCATED_XML_PATTERNS) {
+        if (open.test(stripped) && !close.test(stripped)) return true
+    }
+    return false
+}
+
+function containsReadyToContinuePattern(text: string): boolean {
+    const lines = text.split('\n')
+    const lastLine = lines[lines.length - 1]?.trim()
+    if (!lastLine) return false
+    const lastLines = lines.slice(-3).join('\n')
+    return READY_TO_CONTINUE_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+const DONE_CLAIM_PATTERNS = [
+    /^task\s+done[.!]*$/im,
+    /^done[.!]*$/im,
+    /^all\s+done[.!]*$/im,
+    /^finished[.!]*$/im,
+    /^complete[.!]*$/im,
+    /^task\s+complete[.!]*$/im,
+    /^task\s+completed[.!]*$/im,
+    /^all\s+tasks?\s+complete[.!]*$/im,
+    /^all\s+tasks?\s+completed[.!]*$/im,
+    /^(?:i['']?m\s+)?done\s+with\s+task/im,
+    /\bdone\s+with\s+(?:the\s+)?(?:task|work|implementation)/im,
+    /\bfinished\s+(?:the\s+)?(?:task|work|implementation)/im,
+    /\b(?:all|everything)\s+(?:is\s+)?(?:complete|done|finished)/im,
+    /\bnothing\s+(?:else\s+)?(?:left|remaining|to do)/im,
+    // Russian equivalents: anchored short claims + contextual phrases
+    // Russian equivalents: anchored short claims + contextual phrases.
+    // \b is ASCII-only, so Cyrillic needs explicit \p{L}/\p{N} lookarounds with the u flag.
+    /^готово[.!]*$/imu,
+    /^выполнено[.!]*$/imu,
+    /^сделано[.!]*$/imu,
+    /^завершено[.!]*$/imu,
+    /^решено[.!]*$/imu,
+    /^реализовано[.!]*$/imu,
+    /^задача\s+(?:полностью\s+)?(?:выполнена|решена|закрыта|сделана)[.!]*$/imu,
+    /^все\s+задачи\s+(?:выполнены|завершены|решены|сделаны)[.!]*$/imu,
+    /(?<![\p{L}\p{N}_])(?:задач[аиы]|работ[аиы]|реализация)\s+(?:полностью\s+)?(?:выполнен[аыо]?|завершен[аыо]?|сделан[аыо]?)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])(?:все|всё)\s+(?:задачи\s+)?(?:выполнены|завершены|решены|сделаны)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])(?:все|всё)\s+(?:выполнено|сделано|готово|завершено)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])готово\s+к\s+(?:использованию|проверке|ревью)(?![\p{L}\p{N}_])/imu,
+    /(?<![\p{L}\p{N}_])ничего\s+(?:больше\s+)?(?:не\s+)?(?:осталось|требуется)(?![\p{L}\p{N}_])/imu,
+]
+
+const DONE_WITHOUT_WORK_PROMPT =
+    "I need you to verify more carefully that you have actually completed all the required tasks. " +
+    "Your response indicated you're done, but no work was detected. Please check your todo list " +
+    "and complete any remaining work."
+
+const DONE_WITHOUT_DETAILS_PROMPT =
+    "Your last response claimed the task is complete but contained no work description. This is not acceptable. " +
+    "You MUST respond now with a full, detailed report of everything you did: " +
+    "for each file you modified, state the full path and the exact changes; " +
+    "list every command you ran to verify and its result; state the final outcome. " +
+    "Do NOT reply with 'done', 'task completed', or any short acknowledgment — " +
+    "your ONLY acceptable response right now is this detailed report. Write it now."
+
+function containsDoneClaimPattern(text: string): boolean {
+    const lines = text.split('\n')
+    const lastLines = lines.slice(-5).join('\n')
+    return DONE_CLAIM_PATTERNS.some((pat) => pat.test(lastLines))
+}
+
+// Heuristic, not proof: real reports carry paths/code/commands/results or are long; bare claims are short prose.
+const WORK_REPORT_MIN_LENGTH = 400
+
+const WORK_REPORT_SIGNAL_PATTERNS = [
+    /`[^`\n]+`/,
+    /[\w.@~-]+\/[\w.@~-]+/,
+    /\b(?:bun|npm|npx|node|git|mvn|gradle|pytest|cargo|make)\s+\S+/i,
+    /\b\d+\s*\/\s*\d+\b/,
+]
+
+function containsWorkDescription(text: string): boolean {
+    const trimmed = text.trim()
+    if (trimmed.length >= WORK_REPORT_MIN_LENGTH) return true
+    return WORK_REPORT_SIGNAL_PATTERNS.some((pat) => pat.test(trimmed))
+}
+
+function isStreamingFailure(
+    errorName: string,
+    errorMessage: string,
+    errorNames: string[] = DEFAULT_STREAMING_FAILURE_ERROR_NAMES,
+    messagePatterns: string[] = DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS,
+): boolean {
+    if (!errorName && !errorMessage) return false
+
+    // Error name match: exact, case-sensitive
+    if (errorName && errorNames.includes(errorName)) {
+        return true
+    }
+
+    // Message pattern match: case-insensitive regex, substring fallback on invalid regex
+    if (errorMessage) {
+        const lowerMessage = errorMessage.toLowerCase()
+        for (const pattern of messagePatterns) {
+            try {
+                if (new RegExp(pattern, "i").test(lowerMessage)) return true
+            } catch {
+                if (lowerMessage.includes(pattern.toLowerCase())) return true
+            }
+        }
+    }
+
+    return false
+}
+
+/**
+ * Error of the NEWEST assistant message. Older errors are stale by definition:
+ * once the model produced a new message, a previous failure is history and
+ * acting on it turns every idle transition into another recovery attempt.
+ * Checks message.error, message.info.error and `type === "retry"` parts.
+ */
+function getLastAssistantError(
+    messages: Array<Record<string, unknown>>,
+): { name: string; message: string; id: string | null } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        const role =
+            (msg.role as string) ??
+            ((msg.info as Record<string, unknown> | undefined)?.role as string)
+        if (role !== "assistant") continue
+
+        const info = msg.info as Record<string, unknown> | undefined
+        const id =
+            (msg.id as string | undefined) ??
+            (info?.id as string | undefined) ??
+            null
+        const err =
+            (msg.error as Record<string, unknown> | undefined) ??
+            (info?.error as Record<string, unknown> | undefined)
+        if (err) {
+            const data = err.data as Record<string, unknown> | undefined
+            const name = (err.name as string) ?? ""
+            const message =
+                (data?.message as string) ?? (err.message as string) ?? ""
+            return { name, message, id }
+        }
+
+        const parts = msg.parts as Array<Record<string, unknown>> | undefined
+        if (parts) {
+            for (let j = parts.length - 1; j >= 0; j--) {
+                const part = parts[j]
+                if (part.type !== "retry") continue
+                const partErr = part.error as
+                    | Record<string, unknown>
+                    | undefined
+                if (!partErr) continue
+                const data = partErr.data as
+                    | Record<string, unknown>
+                    | undefined
+                const name = (partErr.name as string) ?? ""
+                const message =
+                    (data?.message as string) ??
+                    (partErr.message as string) ??
+                    ""
+                return { name, message, id }
+            }
+        }
+        return null
+    }
+    return null
+}
+
+/**
+ * Detects a silent dead stream: the NEWEST assistant message has a finish reason
+ * but emitted no text parts (only reasoning or no parts at all). This can happen when
+ * the model stream dies mid-response. Only the newest assistant message is evaluated:
+ * if it has text, the session completed normally and null is returned — never walk
+ * back past a delivered answer to an intermediate tool-call step.
+ */
+function getLastSilentDeadStream(
+    messages: Array<Record<string, unknown>>,
+): { finish: string; outputTokens: number } | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i]
+        const role = (msg.role as string) ??
+            ((msg.info as Record<string, unknown> | undefined)?.role as string)
+        if (role !== "assistant") continue
+
+        const info = msg.info as Record<string, unknown> | undefined
+        const finish = (msg.finish as string) ??
+            (info?.finish as string) ??
+            (info?.finishReason as string)
+        if (!finish) continue
+
+        const parts = (msg.parts as Array<Record<string, unknown>> | undefined) ?? []
+        const hasText = parts.some((p) => {
+            const t = p as Record<string, unknown>
+            return t.type === "text" && typeof t.text === "string" && t.text.length > 0
+        })
+        if (hasText) return null
+
+        const tokens = msg.tokens as Record<string, unknown> | undefined
+        const tInfo = info?.tokens as Record<string, unknown> | undefined
+        const output = ((tokens?.output as number) ?? 0) +
+            ((tInfo?.output as number) ?? 0)
+        return { finish, outputTokens: output }
+    }
+    return null
+}
+
+/**
+ * Exponential backoff for recovery retries: `base * 2^(attempt-1)`, capped at `max`.
+ * Exported as a pure function for unit testing (WP-08).
+ */
+function backoffMs(
+    attempt: number,
+    baseBackoffMs: number = DEFAULT_BASE_BACKOFF_MS,
+    maxBackoffMs: number = DEFAULT_MAX_BACKOFF_MS,
+): number {
+    return Math.min(baseBackoffMs * Math.pow(2, attempt - 1), maxBackoffMs)
+}
+
+/**
+ * Detect an "action intent" — the model ends with `:` announcing intent
+ * (e.g. "Voy a editar el archivo:") without executing. Used to nudge.
+ */
+function containsActionIntent(text: string): boolean {
+    if (text.length <= 15) return false
+    const cleaned = text.replace(/<[a-zA-Z/?][^>]*>/g, "").trim()
+    const lines = cleaned.split('\n')
+    let lastLine = ""
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim().length > 0) {
+            lastLine = lines[i].trim()
+            break
+        }
+    }
+    return lastLine.endsWith(":") && lastLine.length > 5 && lastLine.length < 500
+}
+
+function isOpenTodo(t: Todo): boolean {
+    return t.status === "pending" || t.status === "in_progress"
+}
+
+function getOpenTodos(todos: Todo[]): Todo[] {
+    if (!Array.isArray(todos)) return []
+    return todos.filter(isOpenTodo)
+}
+
+function buildOpenTodosReminder(todos: Todo[]): string {
+    if (!Array.isArray(todos)) return "continue"
+    const open = todos.filter(t => t.status === "pending" || t.status === "in_progress")
+    if (open.length === 0) return "continue"
+    const list = open.map((t, i) => `${i + 1}. [${t.status}] ${t.content}`).join("\n")
+    const plural = open.length > 1 ? "s" : ""
+    const taskWord = open.length > 1 ? "tasks" : "task"
+    const thisWord = open.length > 1 ? "these" : "this"
+    return `You have ${open.length} unfinished task${plural}:\n${list}\n\nPlease continue working on ${thisWord} ${taskWord}.`
+}
+
+// \b is ASCII-only: Cyrillic word boundaries need \p{L}/\p{N} lookarounds + u flag.
+const WAITING_FOR_INPUT_MARKERS: RegExp[] = [
+    /жд(?:ут|у|ёт|ет|ем|ём)\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений)/i,
+    /ожидает\s+(?:вашего\s+|ваших\s+)?(?:подтверждения|ответа|ответов|решения|выбора|уточнений|ввода)/i,
+    /(?<![\p{L}\p{N}_])подтвердите(?![\p{L}\p{N}_])/iu,
+    /(?<![\p{L}\p{N}_])ответьте(?![\p{L}\p{N}_])/iu,
+    /waiting\s+for\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /await(?:s|ing)\s+(?:your|the|user|client|confirmation|approval|input|feedback|answers?|responses?)/i,
+    /please\s+(?:confirm|answer|reply)/i,
+]
+
+/**
+ * Mirrored in test-utils.ts for unit tests — must NOT be exported here:
+ * OpenCode's plugin loader calls every module export as a Plugin entrypoint
+ * (see the exports-guard test).
+ */
+function textWaitsForUserInput(text: string): boolean {
+    if (!text) return false
+    const cleaned = text.replace(/```[\s\S]*?```/g, " ").trim()
+    if (!cleaned) return false
+    const lastLine = cleaned.split("\n").reverse().find(l => l.trim().length > 0)?.trim() ?? ""
+    if (/\?[\s)\]>*_~"'»]*$/.test(lastLine)) return true
+    return WAITING_FOR_INPUT_MARKERS.some(re => re.test(cleaned))
+}
+
+export const AutoResumePlugin: Plugin = async (ctx, options) => {
+    const chunkTimeoutMs: number =
+    (options?.chunkTimeoutMs as number) ?? DEFAULT_CHUNK_TIMEOUT_MS
+    const checkIntervalMs: number =
+    (options?.checkIntervalMs as number) ?? DEFAULT_CHECK_INTERVAL_MS
+    const gracePeriodMs: number =
+    (options?.gracePeriodMs as number) ?? DEFAULT_GRACE_PERIOD_MS
+    const maxRetries: number =
+    (options?.maxRetries as number) ?? DEFAULT_MAX_RETRIES
+    const maxBackoffMs: number =
+    (options?.maxBackoffMs as number) ?? DEFAULT_MAX_BACKOFF_MS
+    const baseBackoffMs: number =
+    (options?.baseBackoffMs as number) ?? DEFAULT_BASE_BACKOFF_MS
+    const subagentWaitMs: number =
+    (options?.subagentWaitMs as number) ?? DEFAULT_SUBAGENT_WAIT_MS
+    const loopMaxContinues: number =
+    (options?.loopMaxContinues as number) ?? DEFAULT_LOOP_MAX_CONTINUES
+    const loopWindowMs: number =
+    (options?.loopWindowMs as number) ?? DEFAULT_LOOP_WINDOW_MS
+    const toolTextCheckDelayMs: number =
+    (options?.toolTextCheckDelayMs as number) ?? DEFAULT_TOOL_TEXT_CHECK_DELAY_MS
+    const maxRecoveryRetries: number =
+    (options?.maxRecoveryRetries as number) ?? DEFAULT_MAX_RECOVERY_RETRIES
+    const minActivityGapMs: number =
+    (options?.minActivityGapMs as number) ?? DEFAULT_MIN_ACTIVITY_GAP_MS
+    const warmupMs: number =
+    (options?.warmupMs as number) ?? DEFAULT_WARMUP_MS
+    const debug: boolean =
+    (options?.debug as boolean) ?? DEFAULT_DEBUG
+    const streamingFailureErrorNames: string[] =
+        (options?.streamingFailureErrorNames as string[]) ?? DEFAULT_STREAMING_FAILURE_ERROR_NAMES
+    const streamingFailureMessagePatterns: string[] =
+        (options?.streamingFailureMessagePatterns as string[]) ?? DEFAULT_STREAMING_FAILURE_MESSAGE_PATTERNS
+    const resumeOnActionIntent: boolean =
+        (options?.resumeOnActionIntent as boolean) !== false
+    const openTodosNudgeEnabled: boolean =
+        (options?.openTodosNudge as boolean) !== false
+    const doneClaimNudgeEnabled: boolean =
+        (options?.doneClaimNudge as boolean) !== false
+    const continuePrompt: string =
+    (options?.continuePrompt as string) ?? "continue"
+    const actionIntentPrompt: string =
+    (options?.actionIntentPrompt as string) ?? continuePrompt
+    const toolTextRecoveryPrompt: string =
+    (options?.toolTextRecoveryPrompt as string) ?? TOOL_TEXT_RECOVERY_PROMPT
+    const thinkingToolRecoveryPrompt: string =
+    (options?.thinkingToolRecoveryPrompt as string) ?? THINKING_TOOL_RECOVERY_PROMPT
+    const doneWithoutWorkPrompt: string =
+        (options?.doneWithoutWorkPrompt as string) ?? DONE_WITHOUT_WORK_PROMPT
+    const doneWithoutDetailsPrompt: string =
+        (options?.doneWithoutDetailsPrompt as string) ?? DONE_WITHOUT_DETAILS_PROMPT
+    const silentDeadStreamMinTokens: number =
+        (options?.silentDeadStreamMinTokens as number) ?? DEFAULT_SILENT_DEAD_STREAM_MIN_TOKENS
+    const rawBusyStallStrategy = (options?.busyStallStrategy as string) ?? "continue"
+    const busyStallStrategy: "continue" | "abort" | "off" =
+        rawBusyStallStrategy === "abort" || rawBusyStallStrategy === "off"
+            ? rawBusyStallStrategy
+            : "continue"
+    const usageLimitEnabled: boolean =
+        (options?.usageLimitEnabled as boolean) !== false && DEFAULT_USAGE_LIMIT_ENABLED
+    const rawUsageLimitProviders = options?.usageLimitProviders as string[] | undefined
+    const usageLimitProviders: string[] =
+        Array.isArray(rawUsageLimitProviders) && rawUsageLimitProviders.length > 0
+            ? rawUsageLimitProviders.map((p) => String(p).toLowerCase())
+            : DEFAULT_USAGE_LIMIT_PROVIDERS
+    const usageLimitMessagePatterns: string[] =
+        (options?.usageLimitMessagePatterns as string[]) ?? DEFAULT_USAGE_LIMIT_MESSAGE_PATTERNS
+    const usageLimitGraceMs: number =
+        (options?.usageLimitGraceMs as number) ?? DEFAULT_USAGE_LIMIT_GRACE_MS
+    const usageLimitTimeoutMs: number =
+        (options?.usageLimitTimeoutMs as number) ?? DEFAULT_USAGE_LIMIT_TIMEOUT_MS
+    const usageLimitRecheckMs: number =
+        (options?.usageLimitRecheckMs as number) ?? DEFAULT_USAGE_LIMIT_RECHECK_MS
+    const usageLimitMaxRechecks: number =
+        (options?.usageLimitMaxRechecks as number) ?? DEFAULT_USAGE_LIMIT_MAX_RECHECKS
+    const usageLimitMaxWaitMs: number =
+        (options?.usageLimitMaxWaitMs as number) ?? DEFAULT_USAGE_LIMIT_MAX_WAIT_MS
+    const idleCleanupMs: number =
+        (options?.idleCleanupMs as number) ?? IDLE_CLEANUP_MS
+    const usageLimitScript: string | null =
+        (options?.usageLimitScript as string) ?? null
+    const staleTaskGuardEnabled: boolean =
+        (options?.staleTaskGuardEnabled as boolean) !== false
+    const staleTaskGuardTimeoutMs: number =
+        (options?.staleTaskGuardTimeoutMs as number) ?? DEFAULT_STALE_TASK_GUARD_TIMEOUT_MS
+    const resumeNoteEnabled: boolean =
+        (options?.resumeNoteEnabled as boolean) !== false
+    const resumeNoteText: string =
+        (options?.resumeNoteText as string) ?? RESUME_AFTER_PAUSE_NOTE
+    const bgSnapshotEnabled: boolean =
+        (options?.bgSnapshotEnabled as boolean) !== false
+    const bgSnapshotDir: string =
+        (options?.bgSnapshotDir as string) ?? DEFAULT_BG_SNAPSHOT_DIR
+    const usageLimitProbeOption = options?.usageLimitProbe as
+        | ((modelID: string | null) => Promise<UsageLimitProbe>)
+        | undefined
+    const dbg = (...args: unknown[]) => { if (debug) console.log("[debug]", ...args) }
+
+    const sessions = new Map<string, SessionWatch>()
+    let timer: ReturnType<typeof setInterval> | null = null
+    let discoveryTimer: ReturnType<typeof setInterval> | null = null
+    let initialised = false
+    let prevBusyCount = 0
+
+    function recordContinue(sid: string): void {
+        const w = sessions.get(sid)
+        if (!w) return
+        w.continueTimestamps.push(Date.now())
+        const cutoff = Date.now() - loopWindowMs
+        while (w.continueTimestamps.length > 0 && w.continueTimestamps[0] < cutoff) {
+            w.continueTimestamps.shift()
+        }
+    }
+
+    function isHallucinationLoop(sid: string): boolean {
+        const w = sessions.get(sid)
+        if (!w) return false
+        recordContinue(sid)
+        return w.continueTimestamps.length >= loopMaxContinues
+    }
+
+    const recentLogMsgs = new Map<string, number>()
+    const LOG_DEDUP_WINDOW_MS = 5000
+
+    async function log(level: "debug" | "info" | "warn" | "error", msg: string) {
+        // Suppress repeated identical debug messages within 5s to avoid log storms during DB contention.
+        // Only dedup debug — info/warn/error must always be logged for visibility.
+        if (level === "debug") {
+            const key = `${level}:${msg}`
+            const now = Date.now()
+            const last = recentLogMsgs.get(key)
+            if (last && now - last < LOG_DEDUP_WINDOW_MS) return
+            recentLogMsgs.set(key, now)
+            if (recentLogMsgs.size > 200) {
+                const oldest = [...recentLogMsgs.entries()].sort((a, b) => a[1] - b[1])
+                for (let i = 0; i < 100; i++) recentLogMsgs.delete(oldest[i][0])
+            }
+        }
+        try {
+            await ctx.client.app.log({ body: { service: "auto-resume", level, message: msg } })
+        } catch (e) {
+            console.error("[auto-resume] log() failed:", e instanceof Error ? e.message : String(e))
+        }
+    }
+
+    void log(
+        "info",
+        `auto-resume initialized (v1.2.2): usage-limit waiting ${usageLimitEnabled ? "on" : "off"}` +
+            ` for providers [${usageLimitProviders.join(", ")}]`,
+    )
+
+    async function safe<T>(fn: () => Promise<T>, ctxLabel: string): Promise<T | undefined> {
+        try {
+            return await fn()
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            console.error(`[auto-resume] ${ctxLabel}: ${msg}`)
+            try { await log("error", `${ctxLabel}: ${msg}`) } catch { /* logging best-effort */ }
+            return undefined
+        }
+    }
+
+    function ensureWatch(sid: string): SessionWatch {
+        let w = sessions.get(sid)
+        if (!w) {
+            w = {
+                createdAt: Date.now(),
+                lastActivityAt: Date.now(),
+                status: "unknown",
+                userCancelled: false,
+                resumeAttempts: 0,
+                lastRetryAt: 0,
+                gaveUp: false,
+                orphanWatchStartAt: null,
+                aborting: false,
+                pluginAbortInFlight: false,
+                toolTextRecovered: false,
+                toolTextAttempts: 0,
+                continueTimestamps: [],
+                idleSince: null,
+                continuing: false,
+                todos: [],
+                todoCheckAttempts: 0,
+                toolTextTimer: null,
+                checkingToolText: false,
+                lastSubagentCheckAt: 0,
+                interruptedContinueCount: 0,
+                recentToolCalls: [],
+                toolLoopAttempts: 0,
+                isSubagent: false,
+                completionSignaled: false,
+                todoNudgeAttempts: 0,
+                taskCompleteOverrides: 0,
+                doneClaimNoTodosAttempts: 0,
+                pendingTools: 0,
+                pendingCommands: 0,
+                pendingRecovery: false,
+                pendingRecoveryReason: null,
+                pendingRecoveryAt: 0,
+                recoveryAttempts: 0,
+                watchdogRetryGuard: false,
+                usageLimit: null,
+                usageLimitPending: false,
+                lastUsageLimitErrorId: null,
+            }
+            sessions.set(sid, w)
+        }
+        return w
+    }
+
+    function touchSession(sid: string) {
+        const w = sessions.get(sid)
+        if (w && w.status === "busy" && !w.userCancelled) {
+            w.lastActivityAt = Date.now()
+        }
+    }
+
+    function hasInflightTools(w: SessionWatch): boolean {
+        return w.pendingTools > 0 || w.pendingCommands > 0
+    }
+
+    function busyCount(): number {
+        let count = 0
+        for (const [, w] of sessions) {
+            if (w.status === "busy" && !w.userCancelled) count++
+        }
+        return count
+    }
+
+    function getLoneBusySession(): { sid: string; w: SessionWatch } | null {
+        let found: { sid: string; w: SessionWatch } | null = null
+        let count = 0
+        for (const [sid, w] of sessions) {
+            if (w.status === "busy" && !w.userCancelled) {
+                count++
+                found = { sid, w }
+            }
+        }
+        return count === 1 ? found : null
+    }
+
+    function getSid(ev: Record<string, unknown>): string | undefined {
+        const props = ev.properties as Record<string, unknown> | undefined
+        const sid = (
+            (ev.sessionID as string | undefined) ??
+            (props?.sessionID as string | undefined) ??
+            ((props?.part as Record<string, unknown>)?.sessionID as string | undefined) ??
+            ((props?.info as Record<string, unknown>)?.sessionID as string | undefined)
+        )
+        if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
+            return sid
+        }
+        return undefined
+    }
+
+    function getError(ev: Record<string, unknown>): Record<string, unknown> | undefined {
+        const props = ev.properties as Record<string, unknown> | undefined
+        return (
+            (ev.error as Record<string, unknown> | undefined) ??
+            (props?.error as Record<string, unknown> | undefined)
+        )
+    }
+
+    function getStatusType(ev: Record<string, unknown>): string {
+        const props = ev.properties as Record<string, unknown> | undefined
+        const rawStatus = ev.status ?? props?.status
+        if (typeof rawStatus === "string") return rawStatus
+        if (rawStatus && typeof rawStatus === "object") {
+            const type = (rawStatus as Record<string, unknown>).type
+            if (typeof type === "string") return type
+        }
+        return "unknown"
+    }
+
+    function short(sid: string): string {
+        return sid.length > 12 ? `...${sid.slice(-8)}` : sid
+    }
+
+    /** Clean up idle sessions that have been idle too long. */
+    function cleanupIdleSessions() {
+        const now = Date.now()
+        const toDelete: string[] = []
+        let idleCount = 0
+        const evictable = (w: SessionWatch): boolean => w.status !== "busy" && !w.usageLimit
+
+        for (const [sid, w] of sessions) {
+            if (!evictable(w)) continue
+            idleCount++
+            if (w.idleSince && (now - w.idleSince) > idleCleanupMs) {
+                toDelete.push(sid)
+            }
+        }
+
+        if (idleCount > MAX_IDLE_SESSIONS) {
+            const idleEntries: Array<{ sid: string; idleSince: number }> = []
+            for (const [sid, w] of sessions) {
+                if (evictable(w) && w.idleSince) {
+                    idleEntries.push({ sid, idleSince: w.idleSince })
+                }
+            }
+            idleEntries.sort((a, b) => a.idleSince - b.idleSince)
+            const excess = idleCount - MAX_IDLE_SESSIONS
+            for (let i = 0; i < excess && i < idleEntries.length; i++) {
+                if (!toDelete.includes(idleEntries[i].sid)) {
+                    toDelete.push(idleEntries[i].sid)
+                }
+            }
+        }
+
+        for (const sid of toDelete) {
+            const watch = sessions.get(sid)
+            if (watch) clearUsageLimit(watch, sid, "session evicted")
+            sessions.delete(sid)
+        }
+        if (toDelete.length > 0) {
+            log("debug", `Cleaned up ${toDelete.length} idle session(s). Map size: ${sessions.size}`)
+        }
+    }
+
+    /**
+     * Extract the `{ info, parts }` payload from a `session.prompt()` result.
+     * Handles both the SDK client shape (`{ data: { info, parts } }`) and the
+     * raw payload shape (`{ info, parts }`). Returns null on unexpected shapes
+     * so the caller can log the raw response for debugging.
+     */
+    function getPromptResponsePayload(result: unknown): SessionPromptResponses[200] | null {
+        if (!result || typeof result !== "object") return null
+        const raw = result as Record<string, unknown>
+        const data = raw.data as Record<string, unknown> | undefined
+        if (data && typeof data === "object" && "parts" in data) {
+            return data as unknown as SessionPromptResponses[200]
+        }
+        if ("parts" in raw) {
+            return raw as unknown as SessionPromptResponses[200]
+        }
+        return null
+    }
+
+    /**
+     * Diagnostic logging for a `session.prompt()` response (WP-06).
+     * Never throws and never alters control flow — observability only.
+     */
+    async function logPromptResponse(result: unknown, context: { sessionId: string; isRetry?: boolean }) {
+        const payload = getPromptResponsePayload(result)
+        const isRetry = context.isRetry ?? false
+        if (!payload) {
+            await log("debug", `${short(context.sessionId)} - session.prompt() response has unexpected structure: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result) })}`)
+            return
+        }
+        const parts = Array.isArray(payload.parts) ? payload.parts : []
+        const partsCount = parts.length
+        const info = payload.info && typeof payload.info === "object" ? payload.info : undefined
+        const infoKeys = info ? Object.keys(info) : []
+        const hasParts = partsCount > 0
+
+        await log("debug", `${short(context.sessionId)} - session.prompt() response received: ${JSON.stringify({ sessionId: context.sessionId, isRetry, hasParts, partsCount, infoKeys, info })}`)
+
+        if (partsCount === 0) {
+            await log("warn", `${short(context.sessionId)} - session.prompt() returned empty parts array - possible stream initiation failure: ${JSON.stringify({ sessionId: context.sessionId, isRetry, responseInfo: info, partsCount })}`)
+        }
+
+        if (info && "error" in info) {
+            await log("warn", `${short(context.sessionId)} - session.prompt() response.info contains error indicator: ${JSON.stringify({ sessionId: context.sessionId, isRetry, errorInfo: info.error })}`)
+        }
+
+        await log("debug", `${short(context.sessionId)} - session.prompt() raw response: ${JSON.stringify({ sessionId: context.sessionId, isRetry, rawResponse: JSON.stringify(result, null, 2) })}`)
+    }
+
+    async function sendContinuePrompt(sid: string, text: string, w: SessionWatch): Promise<boolean> {
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Continue prompt suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
+            return false
+        }
+        if (w.continuing && !w.watchdogRetryGuard) {
+            await log("debug", `${short(sid)} - continue already in progress, skipping`)
+            return false
+        }
+        if (w.userCancelled || w.completionSignaled) return false
+        if (await isQuestionPending(sid)) {
+            dbg(`Continue prompt suppressed on ${short(sid)}: user question pending`)
+            return false
+        }
+        if (!w.continuing) dbg(`State transition on ${short(sid)}: continuing=false -> true`)
+        w.continuing = true
+        if (w.watchdogRetryGuard) {
+            // Watchdog retry: keep the recovery armed so the retried prompt's
+            // own deferred watchdog continues the escalation chain (WP-05).
+            w.pendingRecovery = true
+        }
+        w.watchdogRetryGuard = false
+        
+        let agent: string | undefined
+        let model: { providerID: string; modelID: string } | undefined
+        
+        try {
+            const msgs = await getSessionMessages(sid)
+
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                const role =
+                    (msg.role as string) ??
+                    ((msg.info as Record<string, unknown> | undefined)?.role as string)
+                if (role === "user") {
+                    const rawAgent = msg.agent as string | undefined
+                    if (typeof rawAgent === "string") {
+                        agent = rawAgent
+                    } else {
+                        const fallbackAgent = (msg.info as Record<string, unknown> | undefined)?.agent as string | undefined
+                        if (typeof fallbackAgent === "string") {
+                            agent = fallbackAgent
+                        }
+                    }
+
+                    let rawModel = msg.model as
+                        | { providerID: string; modelID: string }
+                        | undefined
+                    if (!rawModel) {
+                        rawModel = (msg.info as Record<string, unknown> | undefined)?.model as
+                            | { providerID: string; modelID: string }
+                            | undefined
+                    }
+                    if (
+                        rawModel &&
+                        typeof rawModel.providerID === "string" &&
+                        typeof rawModel.modelID === "string"
+                    ) {
+                        model = {
+                            providerID: rawModel.providerID,
+                            modelID: rawModel.modelID,
+                        }
+                    }
+                    break
+                }
+            }
+
+            dbg(`Recovery prompt sent to ${short(sid)}: prompt="${text.length > 80 ? `${text.slice(0, 80)}...` : text}", agent=${agent ?? "(default)"}, model=${model ? `${model.providerID}/${model.modelID}` : "(default)"}`)
+            const response = await ctx.client.session.prompt({
+                path: { id: sid },
+                body: {
+                    parts: [{ type: "text", text }],
+                    agent,
+                    model,
+                },
+            })
+            await logPromptResponse(response, { sessionId: sid })
+            await log(
+                "debug",
+                `${short(sid)} - prompt sent with agent: ${agent ?? "(default)"}, model: ${model ? `${model.providerID}/${model.modelID}` : "(default)"}`,
+            )
+            recordContinue(sid)
+            w.lastRetryAt = Date.now()
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - prompt failed: ${errMsg}`)
+            try {
+                const retryResponse = await ctx.client.session.prompt({
+                    path: { id: sid },
+                    body: { parts: [{ type: "text", text }], agent, model },
+                })
+                await logPromptResponse(retryResponse, { sessionId: sid, isRetry: true })
+                recordContinue(sid)
+                w.lastRetryAt = Date.now()
+            } catch (retryErr) {
+                const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+                await log("error", `${short(sid)} - prompt retry also failed: ${retryMsg}`)
+                throw retryErr
+            }
+        } finally {
+            if (w.continuing) dbg(`State transition on ${short(sid)}: continuing=true -> false`)
+            w.continuing = false
+            w.todoCheckAttempts = 0
+            if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+        }
+        // Deferred check: verify the session went busy after prompt.
+        // If this was a streaming-failure recovery (pendingRecovery armed),
+        // retry up to maxRecoveryRetries and then escalate to abort+resume.
+        setTimeout(async () => {
+            if (w.status !== "busy") {
+                if (w.pendingRecovery) {
+                    if (w.recoveryAttempts < maxRecoveryRetries) {
+                        w.recoveryAttempts++
+                        dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
+                        w.watchdogRetryGuard = true
+                        await log("warn", `${short(sid)} - recovery attempt ${w.recoveryAttempts}/${maxRecoveryRetries} after prompt timeout`)
+                        await log("warn", `Recovery failed on ${short(sid)} - session still ${w.status}: attempt=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, nextAction=retry`)
+                        dbg(`Watchdog check on ${short(sid)}: status=${w.status}, recoveryAttempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, watchdogLatencyMs=${Date.now() - w.lastRetryAt} -> RETRY`)
+                        const retryBackoffMs = backoffMs(w.recoveryAttempts, baseBackoffMs, maxBackoffMs)
+                        await log("info", `Retrying recovery on ${short(sid)}: attempt=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}`)
+                        dbg(`Retrying recovery on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts}, backoffMs=${retryBackoffMs}, pendingRecoveryReason=${w.pendingRecoveryReason}`)
+                        try {
+                            await sendContinuePrompt(sid, continuePrompt, w)
+                        } catch (err) {
+                            const errMsg = err instanceof Error ? err.message : String(err)
+                            await log("warn", `${short(sid)} - recovery retry failed: ${errMsg}`)
+                            // Let the timer loop re-initiate the recovery
+                            w.recoveryAttempts = 0
+                        }
+                        w.watchdogRetryGuard = false
+                    } else {
+                        dbg(`Pending recovery cleared on ${short(sid)}: reason=recovery-attempt`)
+                        w.pendingRecovery = false
+                        await log("warn", `${short(sid)} - max recovery attempts (${maxRecoveryRetries}) reached, escalating to abort+resume`)
+                        await log("warn", `Recovery failed on ${short(sid)} - session still ${w.status}: attempt=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, nextAction=abort-resume`)
+                        await log("warn", `Escalating to abort+resume on ${short(sid)}: attempt=${w.recoveryAttempts}`)
+                        dbg(`Watchdog check on ${short(sid)}: status=${w.status}, recoveryAttempts=${w.recoveryAttempts}, maxRetries=${maxRecoveryRetries}, watchdogLatencyMs=${Date.now() - w.lastRetryAt} -> ABORT_RESUME`)
+                        const resumed = await tryAbortAndResume(sid, w)
+                        if (!resumed && !w.aborting) {
+                            await log("warn", `Recovery exhausted on ${short(sid)}: attempts=${w.recoveryAttempts}, lastError=abort+resume failed`)
+                            dbg(`Watchdog check on ${short(sid)}: status=${w.status} -> GAVE_UP`)
+                            if (w.pendingRecoveryAt > 0) {
+                                dbg(`Total recovery cycle on ${short(sid)} (failed): totalCycleMs=${Date.now() - w.pendingRecoveryAt}`)
+                            }
+                        }
+                    }
+                } else {
+                    await log("warn", `${short(sid)} - prompt sent >${toolTextCheckDelayMs / 1000}s ago but session is still ${w.status}`)
+                }
+            } else {
+                const elapsedMs = Date.now() - w.lastRetryAt
+                await log("info", `Recovery successful on ${short(sid)}: elapsedMs=${elapsedMs}`)
+                dbg(`Watchdog check on ${short(sid)}: status=busy, elapsedMs=${elapsedMs} -> SUCCESS`)
+                if (w.pendingRecoveryAt > 0) {
+                    dbg(`Total recovery cycle on ${short(sid)}: totalCycleMs=${Date.now() - w.pendingRecoveryAt}`)
+                }
+            }
+        }, toolTextCheckDelayMs)
+        return true
+    }
+
+    function extractMessages(response: Record<string, unknown>): Array<Record<string, unknown>> {
+        if (Array.isArray(response)) return response
+        if (Array.isArray(response.data)) return response.data
+        if (Array.isArray(response.messages)) return response.messages
+        return []
+    }
+
+    const messagesInflight = new Map<string, Promise<Array<Record<string, unknown>>>>()
+
+    async function getSessionMessages(sid: string): Promise<Array<Record<string, unknown>>> {
+        const inflight = messagesInflight.get(sid)
+        if (inflight) return inflight
+        const p = (async () => {
+            try {
+                const response = await ctx.client.session.messages({ path: { id: sid } })
+                return extractMessages(response as Record<string, unknown>)
+            } finally {
+                messagesInflight.delete(sid)
+            }
+        })()
+        messagesInflight.set(sid, p)
+        return p
+    }
+
+    const NO_PENDING_QUESTIONS: ReadonlySet<string> = new Set()
+
+    /**
+     * Sessions with a question waiting for the user (`question` tool). A
+     * pending question suspends the turn: the session reports idle with open
+     * todos, which every recovery path misreads as a hang. Fails open —
+     * without the question API (older OpenCode) or on error, recovery
+     * proceeds as before.
+     */
+    async function fetchPendingQuestionSessionIds(): Promise<ReadonlySet<string>> {
+        try {
+            const questionClient = (ctx.client as unknown as {
+                question?: { list?: () => Promise<unknown> }
+            }).question
+            const listQuestions = questionClient?.list
+            if (typeof listQuestions !== "function") return NO_PENDING_QUESTIONS
+            const response = await listQuestions.call(questionClient)
+            const requests = extractMessages((response ?? {}) as Record<string, unknown>)
+            const ids = new Set<string>()
+            for (const request of requests) {
+                const sid = (request as { sessionID?: unknown }).sessionID
+                if (typeof sid === "string" && sid) ids.add(sid)
+            }
+            return ids
+        } catch (err) {
+            dbg(`question.list() failed, assuming no pending questions: ${err instanceof Error ? err.message : String(err)}`)
+            return NO_PENDING_QUESTIONS
+        }
+    }
+
+    async function isQuestionPending(sid: string): Promise<boolean> {
+        return (await fetchPendingQuestionSessionIds()).has(sid)
+    }
+
+    function roleOf(msg: Record<string, unknown> | undefined): string | undefined {
+        if (!msg) return undefined
+        return (msg.role as string) ?? ((msg.info as Record<string, unknown> | undefined)?.role as string)
+    }
+
+    async function lastAssistantEndsWithCelebration(sid: string): Promise<boolean> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                let text = ""
+                for (const part of parts) {
+                    if (part.type === "text") {
+                        text += (part.text as string) ?? ""
+                    }
+                }
+                const normalized = text.trim().replace(/[.!?]+$/, '')
+                return normalized.endsWith('🎉')
+            }
+        } catch {
+            // on error, don't block continue
+        }
+        return false
+    }
+
+    /**
+     * True when the newest assistant message signals "waiting for user
+     * input" (ends with a question mark or contains a waiting marker).
+     * Sibling of the pending-question guard: that one covers questions asked
+     * via the `question` tool, this one covers plain-text questions and
+     * confirmation requests. Fails open on errors.
+     */
+    async function lastAssistantWaitsForUserInput(sid: string): Promise<boolean> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+                let text = ""
+                for (const part of parts) {
+                    if (part.type === "text") {
+                        text += (part.text as string) ?? ""
+                    }
+                }
+                return textWaitsForUserInput(text)
+            }
+        } catch {
+            // on error, don't block continue
+        }
+        return false
+    }
+
+    async function getSessionStatusMap(): Promise<Record<string, string>> {
+        try {
+            const response = await ctx.client.session.status()
+            const raw = ((response as Record<string, unknown>).data ?? response) as Record<string, unknown>
+            const result: Record<string, string> = {}
+            if (raw && typeof raw === "object") {
+                for (const [sid, val] of Object.entries(raw)) {
+                    if (typeof val === "string") {
+                        result[sid] = val
+                    } else if (val && typeof val === "object") {
+                        const type = (val as Record<string, unknown>).type
+                        if (typeof type === "string") result[sid] = type
+                    }
+                }
+            }
+            return result
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `session.status() failed: ${errMsg}`)
+            return {}
+        }
+    }
+
+    function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)
+            p.then(
+                (v) => { clearTimeout(t); resolve(v) },
+                (e) => { clearTimeout(t); reject(e) },
+            )
+        })
+    }
+
+    type SessionInfoResult =
+        | { kind: "info"; info: Record<string, any> }
+        | { kind: "missing" }
+        | { kind: "unknown" }
+
+    async function fetchSessionInfo(sid: string): Promise<SessionInfoResult> {
+        try {
+            const response = await ctx.client.session.get({ path: { id: sid } })
+            const raw = (response ?? {}) as Record<string, any>
+            if (raw && typeof raw === "object" && "error" in raw && raw.error) {
+                const status = raw.response?.status
+                return status === 404 || status === undefined ? { kind: "missing" } : { kind: "unknown" }
+            }
+            const data = raw?.data ?? raw
+            if (data && typeof data === "object" && typeof data.id === "string") {
+                return { kind: "info", info: data }
+            }
+            return { kind: "unknown" }
+        } catch {
+            return { kind: "unknown" }
+        }
+    }
+
+    async function lookupSessionExists(sid: string): Promise<"exists" | "missing" | "unknown"> {
+        try {
+            const result = await withTimeout(fetchSessionInfo(sid), staleTaskGuardTimeoutMs, `session.get(${short(sid)})`)
+            if (result.kind === "info") return "exists"
+            if (result.kind === "missing") return "missing"
+            return "unknown"
+        } catch {
+            return "unknown"
+        }
+    }
+
+    async function guardStaleTaskId(parentSid: string, args: Record<string, unknown>): Promise<void> {
+        const taskId = args.task_id
+        if (typeof taskId !== "string" || taskId.length === 0) return
+        const lookup = await lookupSessionExists(taskId)
+        if (lookup !== "missing") {
+            if (lookup === "unknown") {
+                dbg(`Stale task guard on ${short(parentSid)}: session.get(${short(taskId)}) inconclusive, leaving args untouched`)
+            }
+            return
+        }
+        delete args.task_id
+        if (typeof args.prompt === "string") {
+            args.prompt = `${args.prompt}\n\n${STALE_TASK_NOTE}`
+        }
+        await log(
+            "info",
+            `Stale task_id ${short(taskId)} on ${short(parentSid)}: session missing from storage; dropping task_id, continuing with a fresh subagent session`,
+        )
+    }
+
+    const bgSnapshotsDone = new Set<string>()
+
+    async function snapshotBgResult(sid: string): Promise<void> {
+        if (!bgSnapshotEnabled || bgSnapshotsDone.has(sid)) return
+        try {
+            const parentID = await sessionParentID(sid)
+            if (!parentID) {
+                bgSnapshotsDone.add(sid)
+                return
+            }
+            const msgs = await getSessionMessages(sid)
+            let text = ""
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                if (roleOf(msg) !== "assistant") continue
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (parts) {
+                    for (const part of parts) {
+                        if (part.type === "text") text += (part.text as string) ?? ""
+                    }
+                }
+                break
+            }
+            text = text.trim()
+            if (!text) return
+            await mkdir(bgSnapshotDir, { recursive: true })
+            const target = join(bgSnapshotDir, `${sid}.txt`)
+            const tmp = join(bgSnapshotDir, `.${sid}.tmp`)
+            await writeFile(tmp, text, "utf8")
+            await rename(tmp, target)
+            bgSnapshotsDone.add(sid)
+            await log("info", `Bg result snapshot saved for ${short(sid)}`)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            dbg(`bg result snapshot failed for ${short(sid)}: ${errMsg}`)
+        }
+    }
+
+    async function sessionParentID(sid: string): Promise<string | null> {
+        const result = await fetchSessionInfo(sid)
+        if (result.kind !== "info") return null
+        const parentID = result.info.parentID
+        return typeof parentID === "string" && parentID.length > 0 ? parentID : null
+    }
+
+    // In-memory cache + inflight dedup to avoid concurrent SQLite reads
+    const todoCache = new Map<string, { todos: Todo[]; fetchedAt: number }>()
+    const todoInflight = new Map<string, Promise<Todo[]>>()
+    const TODO_CACHE_TTL_MS = 2000
+
+    async function fetchSessionTodos(sid: string): Promise<Todo[]> {
+        if (typeof sid !== "string" || !sid.startsWith("ses")) return []
+        // Cache hit — avoid hitting the DB if we fetched recently
+        const cached = todoCache.get(sid)
+        if (cached && Date.now() - cached.fetchedAt < TODO_CACHE_TTL_MS) return cached.todos
+        // Dedup concurrent calls for the same session — only one DB query at a time
+        const inflight = todoInflight.get(sid)
+        if (inflight) return inflight
+        const p = (async () => {
+            try {
+                const todoFn = (ctx.client.session as any).todo
+                if (typeof todoFn !== "function") return []
+                const response = await todoFn.call(ctx.client.session, { path: { id: sid } })
+                const rawTodos = ((response as Record<string, unknown>).data ?? response) as unknown
+                if (!Array.isArray(rawTodos)) return []
+                const todos = rawTodos.map((t) => ({
+                    content: (t?.content as string) ?? "",
+                    status: (t?.status as Todo["status"]) ?? "pending",
+                    priority: (t?.priority as Todo["priority"]) ?? "medium",
+                }))
+                todoCache.set(sid, { todos, fetchedAt: Date.now() })
+                return todos
+            } catch {
+                return []
+            } finally {
+                todoInflight.delete(sid)
+            }
+        })()
+        todoInflight.set(sid, p)
+        return p
+    }
+
+    const SUBAGENT_STUCK_MS = 60_000
+
+    const SUBAGENT_RECOVERY_PROMPT = "It looks like you may have stalled or timed out. Please retry the last operation or continue with the task."
+
+    async function recoverSubagent(subagentSid: string): Promise<boolean> {
+        try {
+            await ctx.client.session.prompt({
+                path: { id: subagentSid },
+                body: { parts: [{ type: "text", text: SUBAGENT_RECOVERY_PROMPT }] },
+            })
+            await log("info", `Sent recovery prompt to subagent ${short(subagentSid)}`)
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `Failed to recover subagent ${short(subagentSid)}: ${errMsg}`)
+            return false
+        }
+    }
+
+        async function hasBusySubagents(parentSid: string): Promise<boolean> {
+        try {
+            const statusMap = await getSessionStatusMap()
+            for (const [sId, statusType] of Object.entries(statusMap)) {
+                if (!sId || sId === parentSid) continue
+                if (statusType === "busy") return true
+            }
+            return false
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `hasBusySubagents failed for ${short(parentSid)}: ${errMsg}`)
+            return false
+        }
+    }
+
+        async function checkSessionHasActiveTool(sid: string): Promise<boolean> {
+        try {
+            const statusMap = await getSessionStatusMap()
+            if (statusMap[sid] === "busy") {
+                await log("debug", `Session ${short(sid)} is busy, likely executing a tool`)
+                return true
+            }
+
+            const messages = await getSessionMessages(sid)
+            const lastMsg = messages[messages.length - 1]
+
+            if (!lastMsg) return false
+
+            if (roleOf(lastMsg) !== "assistant") return false
+
+            const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
+            const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
+            const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
+
+            const hasToolCall = toolCall !== undefined
+                || (toolCalls?.length ?? 0) > 0
+                || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call" || p.type === "tool_use") ?? false)
+
+            return hasToolCall
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `checkSessionHasActiveTool failed for ${short(sid)}: ${errMsg}`)
+            return false
+        }
+    }
+
+        async function checkSubagentStatus(parentSid: string): Promise<{ status: "crashed" | "idle" | "busy" | "unknown"; stuckSid?: string }> {
+        try {
+            const statusMap = await getSessionStatusMap()
+            const now = Date.now()
+
+            let hasBusySubagent = false
+
+            for (const [sId, statusType] of Object.entries(statusMap)) {
+                if (!sId || sId === parentSid) continue
+
+                if (statusType === "busy") {
+                    hasBusySubagent = true
+                    const messages = await getSessionMessages(sId)
+                    const lastMsg = messages[messages.length - 1]
+
+                    if (lastMsg && roleOf(lastMsg) === "assistant" && ("error" in lastMsg || (lastMsg.info && "error" in (lastMsg.info as Record<string, unknown>)))) {
+                        await log("debug", `Subagent ${short(sId)} appears crashed`)
+                        return { status: "crashed" }
+                    }
+
+                    const msgTime = (lastMsg?.time as Record<string, number> | undefined)?.created ?? (lastMsg?.time as number | undefined)
+                    if (!msgTime) continue
+
+                    const toolCall = lastMsg.toolCall as Record<string, unknown> | undefined
+                    const toolCalls = lastMsg.tool_calls as Array<Record<string, unknown>> | undefined
+                    const parts = lastMsg.parts as Array<Record<string, unknown>> | undefined
+                    const hasToolCall = toolCall !== undefined
+                        || (toolCalls?.length ?? 0) > 0
+                        || (parts?.some((p: Record<string, unknown>) => p.type === "tool-call") ?? false)
+
+                    const isStuck = hasToolCall
+                        ? now - msgTime > SUBAGENT_STUCK_MS * 3
+                        : now - msgTime > SUBAGENT_STUCK_MS
+                    if (isStuck) {
+                        await log("debug", `Subagent ${short(sId)} stuck - no new text in >${hasToolCall ? 3 : 1}min`)
+                        return { status: "crashed", stuckSid: sId }
+                    }
+                }
+            }
+
+            if (!hasBusySubagent) {
+                return { status: "idle" }
+            }
+
+            return { status: "busy" }
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("debug", `checkSubagentStatus failed: ${errMsg}`)
+            return { status: "unknown" }
+        }
+    }
+
+    function resetSessionFlags(w: SessionWatch) {
+        w.userCancelled = false
+        w.resumeAttempts = 0
+        w.pendingTools = 0
+        w.pendingCommands = 0
+        w.gaveUp = false
+        w.orphanWatchStartAt = null
+        w.aborting = false
+        w.toolTextRecovered = false
+        w.toolTextAttempts = 0
+        w.completionSignaled = false
+        w.continueTimestamps = []
+        w.idleSince = null
+        w.continuing = false
+        w.todoCheckAttempts = 0
+        w.checkingToolText = false
+        w.interruptedContinueCount = 0
+        w.recentToolCalls = []
+        w.toolLoopAttempts = 0
+        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+        w.pendingRecovery = false
+        w.pendingRecoveryReason = null
+        w.pendingRecoveryAt = 0
+        w.recoveryAttempts = 0
+        w.watchdogRetryGuard = false
+    }
+
+    function resetBusyFlags(w: SessionWatch) {
+        w.resumeAttempts = 0
+        w.lastRetryAt = 0
+        w.pendingTools = 0
+        w.pendingCommands = 0
+        w.gaveUp = false
+        w.orphanWatchStartAt = null
+        w.aborting = false
+        w.toolTextRecovered = false
+        w.toolTextAttempts = 0
+        w.todoCheckAttempts = 0
+        w.checkingToolText = false
+        w.interruptedContinueCount = 0
+        w.recentToolCalls = []
+        w.toolLoopAttempts = 0
+        w.pendingRecovery = false
+        w.pendingRecoveryReason = null
+        w.pendingRecoveryAt = 0
+        w.recoveryAttempts = 0
+        w.watchdogRetryGuard = false
+        if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+        // Reset nudge budget on each genuine new busy→work cycle (user prompt or agent re-engagement after nudge)
+        w.todoNudgeAttempts = 0
+        w.doneClaimNoTodosAttempts = 0
+        w.continueTimestamps = []
+        // PRESERVE: userCancelled, completionSignaled, idleSince, continuing
+    }
+
+    function resetIdleFlags(w: SessionWatch) {
+        w.aborting = false
+        w.orphanWatchStartAt = null
+        w.idleSince = Date.now()
+        w.pendingTools = 0
+        w.pendingCommands = 0
+    }
+
+    /**
+     * Detect repeating patterns in tool calls (not just consecutive same tool).
+     * Examples:
+     * - A-B-A-B-A-B (pattern length 2)
+     * - A-B-C-A-B-C-A-B-C (pattern length 3)
+     * - edit-read-edit-read-edit-read
+     */
+    function detectPatternLoop(recentTools: string[]): boolean {
+        if (recentTools.length < 6) return false // Need at least 6 calls to detect a pattern
+        
+        for (const patternLen of [2, 3, 4, 5]) {
+            if (recentTools.length < patternLen * 3) continue
+            
+            const pattern = recentTools.slice(-patternLen)
+            
+            let matches = 0
+            for (let i = recentTools.length - patternLen * 2; i >= 0; i -= patternLen) {
+                const slice = recentTools.slice(i, i + patternLen)
+                if (slice.length !== patternLen) break
+                
+                const isMatch = slice.every((tool, idx) => tool === pattern[idx])
+                if (!isMatch) break
+                
+                matches++
+            }
+            
+            if (matches >= 2) return true
+        }
+        return false
+    }
+
+    function trackToolCall(w: SessionWatch, toolName: string): boolean {
+        const now = Date.now()
+        w.recentToolCalls = w.recentToolCalls.filter(call => now - call.at < 120_000)
+        w.recentToolCalls.push({ toolName, at: now })
+        
+        const recentTools = w.recentToolCalls.slice(-15).map(call => call.toolName)
+        if (recentTools.length < 6) return false
+        
+        const lastTool = recentTools[recentTools.length - 1]
+        const consecutiveSame = recentTools.slice(-5).filter(tool => tool === lastTool).length
+        if (consecutiveSame >= 3) return true
+        
+        return detectPatternLoop(recentTools)
+    }
+
+    async function checkForToolCallAsText(sid: string, w: SessionWatch) {
+        if (typeof sid !== "string" || !sid) return
+        if (w.userCancelled || w.toolTextRecovered) return
+        if (w.status !== "idle") return
+        if (w.checkingToolText) return
+        w.checkingToolText = true
+        dbg(`checkForToolCallAsText called for ${short(sid)}, userCancelled=${w.userCancelled}, toolTextRecovered=${w.toolTextRecovered}, toolTextAttempts=${w.toolTextAttempts}`)
+
+        // Backoff for tool-text recovery
+        if (w.toolTextAttempts > 0) {
+            const elapsed = Date.now() - w.lastRetryAt
+            const requiredBackoff = backoffMs(w.toolTextAttempts, baseBackoffMs, maxBackoffMs)
+            if (elapsed < requiredBackoff) return
+        }
+
+        if (w.toolTextAttempts >= maxRetries) return
+
+        await log("debug", `${short(sid)} - checking for tool-call-as-text (attempt ${w.toolTextAttempts + 1})`)
+
+        try {
+            const messages = await getSessionMessages(sid)
+            const recent = messages.slice(-3)
+
+            let bestCandidate: {
+                prompt: string
+                source: string
+                priority: number
+            } | null = null
+
+            let allAssistantText = ""
+
+            for (const msg of recent) {
+                const rawRole = (msg.role ?? (msg.info as Record<string, unknown> | undefined)?.role) as string | undefined
+                if (rawRole !== "assistant") continue
+
+                // Track tool calls from tool_call / tool_calls fields (not just parts)
+                const toolCall = msg.toolCall as Record<string, unknown> | undefined
+                if (toolCall && typeof toolCall === "object" && "name" in toolCall) {
+                    const toolName = toolCall.name as string
+                    if (toolName) {
+                        trackToolCall(w, toolName)
+                    }
+                }
+                
+                const toolCalls = msg.tool_calls as Array<Record<string, unknown>> | undefined
+                if (toolCalls) {
+                    for (const tc of toolCalls) {
+                        if (typeof tc === "object" && "name" in tc) {
+                            const toolName = tc.name as string
+                            if (toolName) {
+                                trackToolCall(w, toolName)
+                            }
+                        }
+                    }
+                }
+
+                const parts = msg.parts as Array<Record<string, unknown>> | undefined
+                if (!parts) continue
+
+                for (const part of parts) {
+                    const partType = part.type as string
+                    let text = ""
+                    let isReasoning = false
+                    let isToolUse = false
+
+                    if (partType === "text") {
+                        text = (part.text as string) ?? ""
+                    } else if (partType === "reasoning") {
+                        text = (part.text as string) ?? ""
+                        isReasoning = true
+                    } else if (partType === "tool_use") {
+                        isToolUse = true
+                        const toolName = (part.name as string) ?? "unknown"
+                        text = `tool_use: ${toolName}`
+                    } else {
+                        continue
+                    }
+
+                    allAssistantText += text + "\n"
+
+                    if (isToolUse) {
+                        const toolName = (part.name as string) ?? "unknown"
+                        const isLoop = trackToolCall(w, toolName)
+                        
+                        if (isLoop && w.toolLoopAttempts < 2) {
+                            w.toolLoopAttempts++
+                            const candidate = {
+                                prompt: TOOL_LOOP_RECOVERY_PROMPT,
+                                source: "tool-loop",
+                                priority: 0,
+                            }
+                            if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                bestCandidate = candidate
+                            }
+                        } else {
+                            const candidate = {
+                                prompt: continuePrompt,
+                                source: "tool-use",
+                                priority: 1,
+                            }
+                            if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                bestCandidate = candidate
+                            }
+                        }
+                    }
+
+                    if (containsToolCallAsText(text)) {
+                        const toolMatch = text.match(/<function=([a-zA-Z_]+)/) || text.match(/<invoke\s+name=([a-zA-Z_]+)/) || text.match(/"name":\s*"([a-zA-Z_]+)/)
+                        if (toolMatch) {
+                            const toolName = toolMatch[1] || "unknown"
+                            const isLoop = trackToolCall(w, toolName)
+                            if (isLoop && w.toolLoopAttempts < 2) {
+                                w.toolLoopAttempts++
+                                const loopCandidate = {
+                                    prompt: TOOL_LOOP_RECOVERY_PROMPT,
+                                    source: "tool-text-loop",
+                                    priority: 0,
+                                }
+                                if (!bestCandidate || loopCandidate.priority < bestCandidate.priority) {
+                                    bestCandidate = loopCandidate
+                                }
+                            }
+                        }
+                        const candidate = {
+                            prompt: isReasoning ? thinkingToolRecoveryPrompt : toolTextRecoveryPrompt,
+                            source: isReasoning ? "reasoning" : "text",
+                            priority: 0,
+                        }
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
+                    }
+
+                    // Reasoning is internal monologue, not a claim to the user —
+                    // done/continue heuristics scan visible text only.
+                    if (!isReasoning && containsReadyToContinuePattern(text)) {
+                        // Check if todos exist and are all completed/cancelled
+                        const todos = w.todos || []
+                        const hasOpenTodos = todos.some(isOpenTodo)
+                        
+                        if (!hasOpenTodos && todos.length > 0) {
+                            // Todos exist but all are completed - check if we've tried enough times
+                            w.todoCheckAttempts++
+                            if (w.todoCheckAttempts >= 2) {
+                                await log("info", `${short(sid)} - todos completed but agent hasn't closed them. Sending continue...`)
+                                const candidate = {
+                                    prompt: continuePrompt,
+                                    source: "todo-completed-continue",
+                                    priority: 1,
+                                }
+                                if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                                    bestCandidate = candidate
+                                }
+                                continue
+                            }
+                            await log("info", `${short(sid)} - skipping continue, todos appear completed (attempt ${w.todoCheckAttempts}/2)`)
+                            continue
+                        }
+                        
+                        const candidate = {
+                            prompt: containsDoneClaimPattern(text)
+                                ? doneWithoutWorkPrompt
+                                : continuePrompt,
+                            source: containsDoneClaimPattern(text)
+                                ? "done-claim"
+                                : "ready-to-continue",
+                            priority: 1,
+                        }
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
+                    }
+                    
+                    // Also trigger on done-claim patterns even without "ready to continue" text
+                    // This catches cases where model says "task completed" but doesn't use 🎉 or tool_call
+                    if (!isReasoning && doneClaimNudgeEnabled && !bestCandidate && containsDoneClaimPattern(text)) {
+                        const todos = w.todos || []
+                        const hasOpenTodos = todos.some(isOpenTodo)
+                        
+                    if (hasOpenTodos) {
+                        await log("info", `${short(sid)} - model claims done but todos remain open. Sending recovery prompt...`)
+                        bestCandidate = {
+                            prompt: doneWithoutWorkPrompt,
+                            source: "done-claim-no-emoji",
+                            priority: 1,
+                        }
+                    } else if (w.doneClaimNoTodosAttempts < maxRetries) {
+                        if (containsWorkDescription(text)) {
+                            await log("info", `${short(sid)} - done claim comes with a work description, skipping details prompt`)
+                        } else {
+                            await log("info", `${short(sid)} - model claims done with no open todos. Sending details prompt (attempt ${w.doneClaimNoTodosAttempts + 1}/${maxRetries})...`)
+                            bestCandidate = {
+                                prompt: doneWithoutDetailsPrompt,
+                                source: "done-claim-no-todos",
+                                priority: 1,
+                            }
+                        }
+                    }
+                    }
+                }
+            }
+
+            if (resumeOnActionIntent) {
+                const lastAssistantMsg = messages.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                if (lastAssistantMsg) {
+                    let lastAssistantText = ""
+                    for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                        lastAssistantText += (part.text as string ?? "") + "\n"
+                    }
+                    if (containsActionIntent(lastAssistantText)) {
+                        dbg(`ACTION INTENT DETECTED in checkForToolCallAsText for ${short(sid)}`)
+                        const candidate = {
+                            prompt: actionIntentPrompt,
+                            source: "action-intent",
+                            priority: 2,
+                        }
+                        if (!bestCandidate || candidate.priority < bestCandidate.priority) {
+                            bestCandidate = candidate
+                        }
+                    }
+                }
+            }
+
+            const trimmedText = allAssistantText.trim()
+            const normalized = trimmedText.replace(/[.!?]+$/, '')
+            if (normalized.endsWith('🎉') && (!bestCandidate || bestCandidate.priority > 0)) {
+                const openCount = getOpenTodos(w.todos || []).length
+                if (openCount > 0) {
+                    await log("info", `${short(sid)} - 🎉 detected but ${openCount} open todos remain, NOT latching completion`)
+                } else {
+                    await log("info", `${short(sid)} - 🎉 completion detected, skipping continue`)
+                    w.toolTextRecovered = true
+                    w.completionSignaled = true
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                    return
+                }
+            }
+
+            if (!bestCandidate) {
+                const todos = w.todos || []
+                const hasOpenTodos = todos.some(isOpenTodo)
+                
+                if (hasOpenTodos && busyCount() === 0) {
+                    if (!openTodosNudgeEnabled) {
+                        dbg(`${short(sid)} - open-todos reminder disabled via openTodosNudge option`)
+                    } else if (await lastAssistantWaitsForUserInput(sid)) {
+                        await log("info", `${short(sid)} - skipping open-todos reminder: assistant appears to be waiting for user input`)
+                    } else {
+                        const reminder = buildOpenTodosReminder(todos)
+                        await log("info", `${short(sid)} - no activity detected but todos remain open (${getOpenTodos(todos).length} tasks). Sending reminder...`)
+                        bestCandidate = {
+                            prompt: reminder,
+                            source: "idle-with-open-todos-reminder",
+                            priority: 2,
+                        }
+                    }
+                } else if (hasOpenTodos && busyCount() > 0) {
+                    await log("debug", `${short(sid)} - todos remain open but ${busyCount()} sessions busy (subagents running), skipping continue`)
+                }
+            }
+
+            if (!bestCandidate) return
+
+            const isOpenTodosReminder = bestCandidate.source === "idle-with-open-todos-reminder"
+            const isDoneClaimNoTodos = bestCandidate.source === "done-claim-no-todos"
+            if (isOpenTodosReminder) {
+                if (w.todoNudgeAttempts >= maxRetries) {
+                    await log("info", `${short(sid)} - max open-todos nudges (${maxRetries}) reached, waiting for activity`)
+                    return
+                }
+            } else if (isDoneClaimNoTodos) {
+                w.doneClaimNoTodosAttempts++
+            } else {
+                w.toolTextRecovered = true
+                w.toolTextAttempts++
+            }
+
+            const attemptNum = isOpenTodosReminder ? w.todoNudgeAttempts : isDoneClaimNoTodos ? w.doneClaimNoTodosAttempts : w.toolTextAttempts
+            await log(
+                "info",
+                `${bestCandidate.source} detected on ${short(sid)}! ` +
+                `Attempt ${attemptNum}/${maxRetries}. Sending recovery prompt...`,
+            )
+
+            // Guard: don't send if another plugin or user recently sent a prompt
+            const timeSinceActivity = Date.now() - w.lastActivityAt
+            if (timeSinceActivity < minActivityGapMs) {
+                await log("info", `${short(sid)} - skipping ${bestCandidate.source}, session was active ${Math.round(timeSinceActivity / 1000)}s ago`)
+                return
+            }
+
+            if (isHallucinationLoop(sid)) {
+                if (hasInflightTools(w)) {
+                    await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping hallucination abort`)
+                    return
+                }
+                // Fallback: polled heuristic for sessions discovered without hooks
+                const hasActiveTool = await checkSessionHasActiveTool(sid)
+                if (hasActiveTool) {
+                    await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
+                    return
+                }
+                await log("warn", `Hallucination loop detected on ${short(sid)} — aborting instead`)
+                await tryAbortAndResume(sid, w)
+            } else {
+                try {
+                    const sent = await sendContinuePrompt(sid, bestCandidate.prompt, w)
+                    if (sent) {
+                        if (isOpenTodosReminder) w.todoNudgeAttempts++
+                        await log("info", `${short(sid)} - ${bestCandidate.source} recovery sent (attempt ${w.toolTextAttempts})`)
+                    } else {
+                        dbg(`${short(sid)} - ${bestCandidate.source} suppressed (pending user input)`)
+                    }
+                } catch (err) {
+                    const errMsg = err instanceof Error ? err.message : String(err)
+                    await log("warn", `${short(sid)} - ${bestCandidate.source} recovery failed: ${errMsg}`)
+                }
+            }
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            log("debug", `${short(sid)} - could not fetch messages: ${errMsg}`)
+        } finally {
+            w.checkingToolText = false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Abort + Continue
+    // -----------------------------------------------------------------------
+
+    async function tryAbortAndResume(sid: string, w: SessionWatch): Promise<boolean> {
+        if (typeof sid !== "string" || !sid || !sid.startsWith("ses_")) {
+            await log("warn", `Invalid sid for abort: ${sid} (must start with "ses_")`)
+            return false
+        }
+        if (w.userCancelled || w.completionSignaled) return false
+        if (w.aborting) return false
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Abort suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
+            return false
+        }
+        if (await isQuestionPending(sid)) {
+            dbg(`Abort suppressed on ${short(sid)}: user question pending (abort would kill the pending question)`)
+            return false
+        }
+
+        const idleSec = Math.round((Date.now() - (w.orphanWatchStartAt ?? w.lastActivityAt)) / 1000)
+        await log("info", `Abort+Resume on ${short(sid)} (${idleSec}s idle). Aborting...`)
+
+        w.pluginAbortInFlight = true
+        try {
+            await ctx.client.session.abort({ path: { id: sid } })
+            await log("info", `${short(sid)} - abort OK`)
+            dbg(`Abort succeeded on ${short(sid)}, waiting ${ABORT_CONTINUE_DELAY_MS}ms before continue prompt`)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - abort failed: ${errMsg}`)
+            w.aborting = false
+            w.pluginAbortInFlight = false
+            return false
+        }
+
+        await new Promise<void>((resolve) => setTimeout(resolve, ABORT_CONTINUE_DELAY_MS))
+
+        if (w.status === "busy") w.status = "idle"
+
+        try {
+            await sendContinuePrompt(sid, continuePrompt, w)
+            await log("info", `${short(sid)} - abort+continue done`)
+            w.orphanWatchStartAt = null
+            w.resumeAttempts++
+            w.aborting = false
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - continue after abort failed: ${errMsg}`)
+            w.aborting = false
+            return false
+        } finally {
+            w.pluginAbortInFlight = false
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Usage limit (ChatGPT/Codex subscription windows)
+    // -----------------------------------------------------------------------
+
+    async function getSessionProviderModel(
+        sid: string,
+    ): Promise<{ providerID: string | null; modelID: string | null }> {
+        try {
+            const msgs = await getSessionMessages(sid)
+            for (let i = msgs.length - 1; i >= 0; i--) {
+                const msg = msgs[i]
+                const info = msg.info as Record<string, unknown> | undefined
+                const rawModel =
+                    (msg.model as Record<string, unknown> | undefined) ??
+                    (info?.model as Record<string, unknown> | undefined)
+                if (
+                    rawModel &&
+                    typeof rawModel.providerID === "string" &&
+                    typeof rawModel.modelID === "string"
+                ) {
+                    return { providerID: rawModel.providerID, modelID: rawModel.modelID }
+                }
+                const providerID =
+                    (msg.providerID as string | undefined) ??
+                    (info?.providerID as string | undefined)
+                const modelID =
+                    (msg.modelID as string | undefined) ??
+                    (info?.modelID as string | undefined)
+                if (typeof providerID === "string" || typeof modelID === "string") {
+                    return { providerID: providerID ?? null, modelID: modelID ?? null }
+                }
+            }
+        } catch (e) {
+            dbg(`provider/model lookup on ${short(sid)} failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+        return { providerID: null, modelID: null }
+    }
+
+    function isUsageLimitSignal(errorName: string, errorMessage: string): boolean {
+        if (!usageLimitEnabled) return false
+        if (matchesUsageLimitMessage(errorMessage, usageLimitMessagePatterns)) return true
+        const combined = `${errorName} ${errorMessage}`
+        return /\b429\b/.test(combined) && /limit/i.test(combined)
+    }
+
+    function probeUsageLimitsViaScript(
+        script: string,
+        modelID: string | null,
+    ): Promise<UsageLimitProbe> {
+        const args = ["--json"]
+        if (modelID) args.push("--model", modelID)
+        args.push("--grace", String(Math.round(usageLimitGraceMs / 1000)))
+        return new Promise((resolve) => {
+            execFile(
+                script,
+                args,
+                { timeout: usageLimitTimeoutMs + 5_000, maxBuffer: 1 << 20 },
+                (error, stdout) => {
+                    const fail = (reason: string, message: string): void => {
+                        resolve({
+                            ok: false,
+                            limitReached: false,
+                            resetAtMs: null,
+                            resumeAtMs: null,
+                            decidingWindow: null,
+                            graceMs: usageLimitGraceMs,
+                            reason,
+                            message,
+                        })
+                    }
+                    if (error) {
+                        fail("script-error", error.message)
+                        return
+                    }
+                    let parsed: Record<string, unknown>
+                    try {
+                        parsed = JSON.parse(String(stdout)) as Record<string, unknown>
+                    } catch (e) {
+                        fail("script-output", e instanceof Error ? e.message : String(e))
+                        return
+                    }
+                    if (parsed.ok === false) {
+                        fail(
+                            typeof parsed.reason === "string" ? parsed.reason : "script-error",
+                            typeof parsed.message === "string" ? parsed.message : "",
+                        )
+                        return
+                    }
+                    const secondsToMs = (value: unknown): number | null =>
+                        typeof value === "number" && Number.isFinite(value)
+                            ? Math.round(value * 1000)
+                            : null
+                    resolve({
+                        ok: true,
+                        limitReached: parsed.limit_reached === true,
+                        resetAtMs: secondsToMs(parsed.reset_at),
+                        resumeAtMs: secondsToMs(parsed.resume_at),
+                        decidingWindow:
+                            typeof parsed.deciding_window === "string"
+                                ? parsed.deciding_window
+                                : null,
+                        graceMs:
+                            typeof parsed.grace_seconds === "number"
+                                ? parsed.grace_seconds * 1000
+                                : usageLimitGraceMs,
+                    })
+                },
+            )
+        })
+    }
+
+    async function probeUsageLimits(modelID: string | null): Promise<UsageLimitProbe> {
+        if (usageLimitProbeOption) return await usageLimitProbeOption(modelID)
+        if (usageLimitScript) return await probeUsageLimitsViaScript(usageLimitScript, modelID)
+        const result = await evaluateCodexLimits({
+            modelId: modelID,
+            graceMs: usageLimitGraceMs,
+            timeoutMs: usageLimitTimeoutMs,
+        })
+        if (!result.ok) {
+            return {
+                ok: false,
+                limitReached: false,
+                resetAtMs: null,
+                resumeAtMs: null,
+                decidingWindow: null,
+                graceMs: usageLimitGraceMs,
+                reason: result.reason,
+                message: result.message,
+            }
+        }
+        return {
+            ok: true,
+            limitReached: result.limitReached,
+            resetAtMs: result.resetAtMs,
+            resumeAtMs: result.resumeAtMs,
+            decidingWindow: result.decidingWindow,
+            graceMs: result.graceMs,
+        }
+    }
+
+    function clearUsageLimit(w: SessionWatch, sid: string, reason: string): void {
+        w.usageLimitPending = false
+        if (!w.usageLimit) return
+        if (w.usageLimit.timer) clearTimeout(w.usageLimit.timer)
+        w.usageLimit = null
+        dbg(`Usage-limit wait cleared on ${short(sid)}: ${reason}`)
+    }
+
+    async function armUsageLimitResume(
+        sid: string,
+        w: SessionWatch,
+        resumeAtMs: number,
+        resetAtMs: number | null,
+        decidingWindow: string | null,
+        providerID: string | null,
+        modelID: string | null,
+        rechecks: number,
+    ): Promise<void> {
+        if (w.usageLimit?.timer) clearTimeout(w.usageLimit.timer)
+        w.usageLimitPending = false
+        const now = Date.now()
+        const cappedResumeAt = Math.min(
+            Math.max(resumeAtMs, now + 1_000),
+            now + usageLimitMaxWaitMs,
+        )
+        w.usageLimit = {
+            resumeAtMs: cappedResumeAt,
+            resetAtMs,
+            decidingWindow,
+            providerID,
+            modelID,
+            rechecks,
+            timer: null,
+        }
+        w.pendingRecovery = false
+        w.pendingRecoveryReason = null
+        w.pendingRecoveryAt = 0
+        w.recoveryAttempts = 0
+        w.gaveUp = false
+        w.lastRetryAt = now
+        const delay = Math.max(1_000, Math.min(cappedResumeAt - now, MAX_TIMER_DELAY_MS))
+        const timer = setTimeout(() => {
+            void onUsageLimitTimer(sid)
+        }, delay)
+        const unrefable = timer as unknown as { unref?: () => void }
+        if (typeof unrefable.unref === "function") unrefable.unref()
+        w.usageLimit.timer = timer
+        await log(
+            "info",
+            `Usage limit on ${short(sid)} (${providerID ?? "?"}/${modelID ?? "?"}): ` +
+                `resume scheduled at ${formatLocalTime(cappedResumeAt)} (in ${formatDuration(cappedResumeAt - now)})` +
+                (resetAtMs ? `, window reset ${formatLocalTime(resetAtMs)}` : "") +
+                (decidingWindow ? ` [${decidingWindow}]` : "") +
+                `, no retries until then`,
+        )
+    }
+
+    async function applyUsageLimitProbe(
+        sid: string,
+        w: SessionWatch,
+        probe: UsageLimitProbe,
+        providerID: string | null,
+        modelID: string | null,
+        rechecks: number,
+    ): Promise<boolean> {
+        const now = Date.now()
+        if (!probe.ok) {
+            if (rechecks >= usageLimitMaxRechecks) {
+                await log(
+                    "warn",
+                    `Usage limit on ${short(sid)}: cannot determine reset (${probe.reason}: ${probe.message}); giving up after ${rechecks} rechecks`,
+                )
+                clearUsageLimit(w, sid, "rechecks exhausted")
+                return true
+            }
+            const nextCheck = now + usageLimitRecheckMs
+            await armUsageLimitResume(
+                sid,
+                w,
+                nextCheck,
+                null,
+                null,
+                providerID,
+                modelID,
+                rechecks + 1,
+            )
+            await log(
+                "warn",
+                `Usage limit on ${short(sid)}: reset unknown (${probe.reason}: ${probe.message}); ` +
+                    `recheck at ${formatLocalTime(nextCheck)} (${rechecks + 1}/${usageLimitMaxRechecks})`,
+            )
+            return true
+        }
+
+        if (!probe.limitReached) {
+            await log(
+                "info",
+                `Usage-limit signal on ${short(sid)} is stale: usage endpoint reports ` +
+                    `${providerID ?? "?"}/${modelID ?? "?"} available; falling back to normal recovery`,
+            )
+            return false
+        }
+
+        if (probe.resumeAtMs === null) {
+            if (rechecks >= usageLimitMaxRechecks) {
+                await log(
+                    "warn",
+                    `Usage limit on ${short(sid)}: reset moment still unknown after ${rechecks} rechecks; giving up`,
+                )
+                clearUsageLimit(w, sid, "rechecks exhausted")
+                return true
+            }
+            const nextCheck = now + usageLimitRecheckMs
+            await armUsageLimitResume(
+                sid,
+                w,
+                nextCheck,
+                probe.resetAtMs,
+                probe.decidingWindow,
+                providerID,
+                modelID,
+                rechecks + 1,
+            )
+            await log(
+                "warn",
+                `Usage limit on ${short(sid)}: reset moment unknown, recheck at ` +
+                    `${formatLocalTime(nextCheck)} (${rechecks + 1}/${usageLimitMaxRechecks})`,
+            )
+            return true
+        }
+
+        await armUsageLimitResume(
+            sid,
+            w,
+            probe.resumeAtMs,
+            probe.resetAtMs,
+            probe.decidingWindow,
+            providerID,
+            modelID,
+            rechecks,
+        )
+        return true
+    }
+
+    async function onUsageLimitTimer(sid: string): Promise<void> {
+        const w = sessions.get(sid)
+        if (!w || !w.usageLimit) return
+        const wait = w.usageLimit
+        wait.timer = null
+        if (w.userCancelled || w.completionSignaled) {
+            clearUsageLimit(w, sid, "session closed by user")
+            return
+        }
+        await log("info", `Usage-limit wait elapsed on ${short(sid)}: re-checking Codex usage`)
+        const probe = await probeUsageLimits(wait.modelID)
+        const stillWaiting = await applyUsageLimitProbe(
+            sid,
+            w,
+            probe,
+            wait.providerID,
+            wait.modelID,
+            wait.rechecks,
+        )
+        if (stillWaiting) return
+        clearUsageLimit(w, sid, "limit reset")
+        await log("info", `${short(sid)} - usage limit reset, resuming`)
+        try {
+            const resumeText = resumeNoteEnabled ? `${continuePrompt}\n\n${resumeNoteText}` : continuePrompt
+            await sendContinuePrompt(sid, resumeText, w)
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - resume after usage limit failed: ${errMsg}`)
+        }
+    }
+
+    async function handleUsageLimitSignal(
+        sid: string,
+        errorName: string,
+        errorMessage: string,
+        errorId: string | null = null,
+    ): Promise<"handled" | "ignored"> {
+        if (!usageLimitEnabled || !sid) return "ignored"
+        if (!isUsageLimitSignal(errorName, errorMessage)) return "ignored"
+        const w = ensureWatch(sid)
+        if (errorId && w.lastUsageLimitErrorId === errorId) {
+            dbg(`Usage-limit error ${errorId} on ${short(sid)} already handled; suppressing repeat recovery`)
+            return "handled"
+        }
+        if (w.usageLimit && w.usageLimit.resumeAtMs > Date.now()) {
+            dbg(`Usage-limit signal on ${short(sid)} ignored: wait already armed until ${formatLocalTime(w.usageLimit.resumeAtMs)}`)
+            if (errorId) w.lastUsageLimitErrorId = errorId
+            return "handled"
+        }
+        if (w.usageLimitPending) {
+            dbg(`Usage-limit signal on ${short(sid)} suppressed: probe already in flight`)
+            return "handled"
+        }
+        // Mark the wait as pending SYNCHRONOUSLY, before any await: probing the
+        // usage endpoint takes hundreds of ms, and stall-recovery paths
+        // (idle open-todos nudge, abort+resume) consult w.usageLimit between
+        // detection and arming. Without this flag they send prompts straight
+        // into the rate-limited API.
+        w.usageLimitPending = true
+        try {
+            const providerInfo = await getSessionProviderModel(sid)
+            const providerID = providerInfo.providerID
+            const modelID = providerInfo.modelID
+            const provider = (providerID ?? "").toLowerCase()
+            if (!provider) {
+                await log(
+                    "info",
+                    `Usage-limit signal on ${short(sid)} ignored: provider unknown (${truncateForLog(errorMessage)})`,
+                )
+                return "ignored"
+            }
+            if (!usageLimitProviders.includes(provider)) {
+                await log(
+                    "info",
+                    `Usage-limit signal on ${short(sid)} ignored: provider ${providerID} is not in ` +
+                        `usageLimitProviders (${usageLimitProviders.join(", ")})`,
+                )
+                return "ignored"
+            }
+            await log(
+                "info",
+                `Usage limit reported on ${short(sid)} (${providerID}/${modelID ?? "?"}): ` +
+                    `${truncateForLog(errorMessage)}; querying Codex usage endpoint`,
+            )
+            if (errorId) w.lastUsageLimitErrorId = errorId
+            const probe = await probeUsageLimits(modelID)
+            await applyUsageLimitProbe(sid, w, probe, providerID, modelID, 0)
+            return "handled"
+        } finally {
+            // The wait either got armed (armUsageLimitResume resets the flag)
+            // or nothing was armed — never leave a stale pending marker that
+            // would suppress future recovery.
+            if (!w.usageLimit) w.usageLimitPending = false
+        }
+    }
+
+    function truncateForLog(text: string, limit = 200): string {
+        if (!text) return "(empty)"
+        return text.length > limit ? `${text.slice(0, limit)}...` : text
+    }
+
+    // -----------------------------------------------------------------------
+    // Resume: normal stall
+    // -----------------------------------------------------------------------
+
+    async function tryResume(sid: string, w: SessionWatch, reason: string, prompt?: string): Promise<boolean> {
+        if (typeof sid !== "string" || !sid) {
+            await log("warn", `tryResume called with invalid sid: ${sid}`)
+            return false
+        }
+        if (w.usageLimit || w.usageLimitPending) {
+            dbg(`Resume suppressed on ${short(sid)}: usage limit ${w.usageLimit ? `wait until ${formatLocalTime(w.usageLimit.resumeAtMs)}` : "probe in flight"}`)
+            return false
+        }
+        const now = Date.now()
+        const elapsedSinceRetry = now - w.lastRetryAt
+        const requiredBackoff = backoffMs(w.resumeAttempts, baseBackoffMs, maxBackoffMs)
+        if (w.lastRetryAt > 0 && elapsedSinceRetry < requiredBackoff) return false
+
+        if (isHallucinationLoop(sid)) {
+            if (hasInflightTools(w)) {
+                await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping hallucination abort`)
+                w.lastRetryAt = now
+                return false
+            }
+            // Fallback: polled heuristic for sessions discovered without hooks
+            const hasActiveTool = await checkSessionHasActiveTool(sid)
+            if (hasActiveTool) {
+                await log("debug", `Session ${short(sid)} has active tool, skipping hallucination abort`)
+                w.lastRetryAt = now
+                return false
+            }
+            await log("warn", `Hallucination loop on ${short(sid)}! Aborting...`)
+            return await tryAbortAndResume(sid, w)
+        }
+
+        w.resumeAttempts++
+        const idleSec = Math.round((now - w.lastActivityAt) / 1000)
+        await log("info", `${reason} on ${short(sid)} (${idleSec}s, retry ${w.resumeAttempts}/${maxRetries})`)
+
+        try {
+            const sent = await sendContinuePrompt(sid, prompt ?? continuePrompt, w)
+            if (!sent) {
+                // Suppressed (e.g. a user question is pending) — not an attempt.
+                w.resumeAttempts--
+                dbg(`tryResume on ${short(sid)}: prompt suppressed, attempt not counted`)
+                return false
+            }
+            await log("info", `${short(sid)} - retry sent`)
+            return true
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            await log("warn", `${short(sid)} - retry failed: ${errMsg}`)
+            w.lastRetryAt = now
+            return false
+        }
+    }
+
+    async function discoverSessions() {
+        try {
+            const response = await ctx.client.session.list()
+            const list = extractMessages(response as Record<string, unknown>)
+
+            for (const s of list) {
+                const sid = s.id as string
+                if (sid && typeof sid === "string" && sid.startsWith("ses_")) {
+                    const isNew = !sessions.has(sid)
+                    ensureWatch(sid)
+                    const status = s.status as string | undefined
+                    if (status) {
+                        const w = sessions.get(sid)!
+                        w.status = status as SessionWatch["status"]
+                        if (status === "idle") w.idleSince = Date.now()
+                    }
+                    if (isNew) {
+                        log("debug", `Discovered session ${short(sid)} via list() — fetching todos`)
+                        const fetched = await fetchSessionTodos(sid)
+                        if (fetched.length > 0) {
+                            const w = sessions.get(sid)!
+                            w.todos = fetched
+                        }
+                    }
+                }
+            }
+        } catch (err) {
+            const errMsg = err instanceof Error ? err.message : String(err)
+            log("debug", `Session discovery failed: ${errMsg}`)
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Timer: cleanup + session discovery)
+    // -----------------------------------------------------------------------
+
+    function startTimer() {
+        if (timer) return
+        timer = setInterval(async () => {
+            await safe(async () => {
+                const now = Date.now()
+                const numBusy = busyCount()
+                const statusMap = await getSessionStatusMap()
+
+            for (const [sid, w] of sessions) {
+                const realStatus = statusMap[sid]
+                if (realStatus && realStatus !== w.status) {
+                    w.status = realStatus as SessionWatch["status"]
+                    if (realStatus === "busy") w.idleSince = null
+                }
+                
+                if (w.status !== "busy") continue
+                if (w.userCancelled || w.completionSignaled) continue
+                if (w.aborting) continue
+
+                if (w.orphanWatchStartAt !== null) {
+                    const orphanIdle = now - w.orphanWatchStartAt
+                    if (orphanIdle >= subagentWaitMs + gracePeriodMs) {
+                        if (w.resumeAttempts < maxRetries) {
+                            // Guard: never abort the parent while it is running a tool.
+                            // Primary: deterministic in-flight counters from hooks.
+                            if (hasInflightTools(w)) {
+                                await log("debug", `Parent ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping orphan-watch abort`)
+                                w.orphanWatchStartAt = now
+                                continue
+                            }
+                            // Paths B (subagentWait) and C (chunkTimeout) already check
+                            // checkSessionHasActiveTool before aborting; path A was missing
+                            // it, so a long-running parent tool was killed when a subagent
+                            // finished and the orphan timer expired.
+                            const hasActiveTool = await checkSessionHasActiveTool(sid)
+                            if (hasActiveTool) {
+                                await log("debug", `Parent ${short(sid)} has active tool call, skipping orphan-watch abort`)
+                                w.orphanWatchStartAt = now
+                                continue
+                            }
+                            const subStatus = await checkSubagentStatus(sid)
+                            if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                                const recovered = await recoverSubagent(subStatus.stuckSid)
+                                if (recovered) {
+                                    await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
+                                } else {
+                                    await log("info", `Subagent crashed, triggering abort+resume on ${short(sid)}`)
+                                    tryAbortAndResume(sid, w)
+                                }
+                            } else if (subStatus.status === "idle") {
+                                const hasBusySub = await hasBusySubagents(sid)
+                                if (hasBusySub) {
+                                    await log("debug", `Subagents exist but not busy yet, waiting for startup...`)
+                                } else {
+                                    await log("info", `Parent ${short(sid)} stuck with no active subagents. Triggering abort+resume.`)
+                                    tryAbortAndResume(sid, w)
+                                }
+                            } else {
+                                await log("debug", `Subagent still running, waiting...`)
+                            }
+                        } else if (!w.gaveUp) {
+                            w.gaveUp = true
+                            dbg(`State transition on ${short(sid)}: gaveUp=false -> true`)
+                            w.orphanWatchStartAt = null
+                            w.aborting = false
+                            log("warn", `${short(sid)} - orphan retries exhausted.`)
+                        }
+                    }
+                    continue
+                }
+
+                if (numBusy > 1) continue
+
+                // Cooldown: only check subagent status every 10s to avoid redundant API calls
+                if (now - w.lastSubagentCheckAt < checkIntervalMs * 2) continue
+                w.lastSubagentCheckAt = now
+
+                if (w.lastActivityAt > 0 && (now - w.lastActivityAt) > subagentWaitMs) {
+                    if (realStatus === "busy") {
+                        await log("debug", `Session ${short(sid)} is still busy (real status), skipping abort`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+
+                    if (hasInflightTools(w)) {
+                        await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping abort check`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+                    
+                    const hasActiveTool = await checkSessionHasActiveTool(sid)
+                    if (hasActiveTool) {
+                        await log("debug", `Session ${short(sid)} has active tool call, skipping abort check`)
+                        w.lastSubagentCheckAt = now
+                        continue
+                    }
+
+                    const subStatus = await checkSubagentStatus(sid)
+                    if (subStatus.status === "idle" || subStatus.status === "unknown") {
+                        await log("info", `Parent ${short(sid)} stuck with no active subagents. Triggering abort+resume.`)
+                        tryAbortAndResume(sid, w)
+                        continue
+                    } else if (subStatus.status === "crashed" && subStatus.stuckSid) {
+                        const recovered = await recoverSubagent(subStatus.stuckSid)
+                        if (recovered) {
+                            await log("info", `Sent recovery prompt to stuck subagent ${short(subStatus.stuckSid)}, waiting...`)
+                        } else {
+                            await log("info", `Parent ${short(sid)} subagent recovery failed. Triggering abort+resume.`)
+                            tryAbortAndResume(sid, w)
+                        }
+                        continue
+                    }
+                }
+
+                const idle = now - w.lastActivityAt
+                if (idle >= chunkTimeoutMs + gracePeriodMs) {
+                    if (busyStallStrategy === "off") {
+                        dbg(`Stream stall on ${short(sid)} ignored (busyStallStrategy=off)`)
+                        continue
+                    }
+                    // Primary: deterministic in-flight counters from hooks.
+                    // A long-running build/test/command must never be aborted.
+                    if (hasInflightTools(w)) {
+                        await log("debug", `Session ${short(sid)} has ${w.pendingTools} tool(s) in-flight, skipping stall recovery`)
+                        w.lastSubagentCheckAt = now
+                    } else {
+                        // Fallback: Check if main session has an active tool call - if so, don't resume
+                        const hasActiveTool = await checkSessionHasActiveTool(sid)
+                        if (hasActiveTool) {
+                            await log("debug", `Session ${short(sid)} has active tool call, skipping stall recovery`)
+                            w.lastSubagentCheckAt = now
+                        } else if (w.resumeAttempts < maxRetries) {
+                            if (busyStallStrategy === "abort") {
+                                await log("info", `Stream stall on ${short(sid)} (busyStallStrategy=abort): aborting before continue`)
+                                tryAbortAndResume(sid, w)
+                            } else {
+                                tryResume(sid, w, "Stream stall")
+                            }
+                        } else if (!w.gaveUp) {
+                            w.gaveUp = true
+                            dbg(`State transition on ${short(sid)}: gaveUp=false -> true`)
+                            log("warn", `${short(sid)} - all ${maxRetries} retries exhausted.`)
+                        }
+                    }
+                }
+            }
+
+            // Periodic idle session recheck: resume idle sessions with open todos
+            for (const [sid, w] of sessions) {
+                // Pending recovery: trigger deferred recovery for streaming failures (WP-04)
+                if (
+                    w.pendingRecovery &&
+                    w.status === "idle" &&
+                    !w.userCancelled &&
+                    !w.aborting &&
+                    !w.continuing &&
+                    !w.gaveUp &&
+                    !w.usageLimit &&
+                    !w.usageLimitPending &&
+                    // recoveryAttempts === 0: the watchdog chain owns the
+                    // counter once the first recovery send is initiated (WP-05)
+                    w.recoveryAttempts === 0
+                ) {
+                    dbg(`Pending recovery check on ${short(sid)}: pendingRecovery=${w.pendingRecovery}, status=${w.status}, userCancelled=${w.userCancelled}, aborting=${w.aborting}, continuing=${w.continuing}, gaveUp=${w.gaveUp}, recoveryAttempts=${w.recoveryAttempts}, pendingRecoveryAt=${w.pendingRecoveryAt}`)
+                    const elapsed = Date.now() - w.pendingRecoveryAt
+                    const requiredBackoff = backoffMs(w.recoveryAttempts, baseBackoffMs, maxBackoffMs)
+                    if (elapsed < requiredBackoff) {
+                        dbg(`Backoff check on ${short(sid)}: elapsed=${elapsed}ms, required=${requiredBackoff}ms, attempt=${w.recoveryAttempts}, pass=false`)
+                        dbg(`Pending recovery on ${short(sid)} waiting for backoff: ${requiredBackoff - elapsed}ms remaining`)
+                        continue
+                    }
+                    dbg(`Backoff check on ${short(sid)}: elapsed=${elapsed}ms, required=${requiredBackoff}ms, attempt=${w.recoveryAttempts}, pass=true`)
+                    await log("info", `Pending recovery triggered on ${short(sid)}: reason=${w.pendingRecoveryReason}, attempt=${w.recoveryAttempts + 1}, maxRetries=${maxRecoveryRetries}`)
+                    dbg(`Recovery timing on ${short(sid)}: detectionToAttemptMs=${Date.now() - w.pendingRecoveryAt}`)
+                    w.recoveryAttempts++
+                    dbg(`State transition on ${short(sid)}: recoveryAttempts=${w.recoveryAttempts - 1} -> ${w.recoveryAttempts}`)
+                    // Keep pendingRecovery armed: the deferred watchdog (WP-05)
+                    // verifies this recovery and retries/escalates on failure.
+                    try {
+                        await sendContinuePrompt(sid, continuePrompt, w)
+                    } catch (err) {
+                        const errMsg = err instanceof Error ? err.message : String(err)
+                        await log("warn", `${short(sid)} - pending recovery failed: ${errMsg}`)
+                        w.recoveryAttempts = 0
+                    }
+                }
+
+                if (w.status !== "idle") continue
+                if (w.isSubagent) continue
+                if (w.userCancelled || w.completionSignaled) continue
+                if (w.continuing) continue
+                if (busyCount() !== 0) continue
+                // Lazy fetch: if we never received a todo.updated event, try the API
+                if ((w.todos || []).length === 0) {
+                    const fetched = await fetchSessionTodos(sid)
+                    if (fetched.length > 0) {
+                        w.todos = fetched
+                    }
+                }
+                const open = getOpenTodos(w.todos || [])
+                if (open.length === 0) continue
+                if (w.todoNudgeAttempts >= maxRetries) continue
+                if (!openTodosNudgeEnabled) {
+                    dbg(`${short(sid)} - idle todo nudge disabled via openTodosNudge option`)
+                    continue
+                }
+                const elapsedSinceLastNudge = Date.now() - w.lastRetryAt
+                const requiredBackoff = backoffMs(w.todoNudgeAttempts, baseBackoffMs, maxBackoffMs)
+                if (w.lastRetryAt > 0 && elapsedSinceLastNudge < requiredBackoff) continue
+                if (await lastAssistantWaitsForUserInput(sid)) {
+                    await log("info", `${short(sid)} - skipping idle todo nudge: assistant appears to be waiting for user input`)
+                    continue
+                }
+                const isCelebration = await lastAssistantEndsWithCelebration(sid)
+                if (isCelebration) {
+                    const openCount = getOpenTodos(w.todos || []).length
+                    if (openCount > 0) {
+                        await log("info", `${short(sid)} - 🎉 detected in periodic recheck but ${openCount} open todos remain, NOT latching completion`)
+                    } else {
+                        w.toolTextRecovered = true
+                        w.completionSignaled = true
+                    }
+                    continue
+                }
+                const reminder = buildOpenTodosReminder(w.todos || [])
+                const sent = await tryResume(sid, w, "Idle with open todos (periodic)", reminder)
+                if (sent) {
+                    w.todoNudgeAttempts++
+                    await log("info", `${short(sid)} - idle periodic recheck: nudge ${w.todoNudgeAttempts}/${maxRetries}`)
+                }
+            }
+
+            // Periodic cleanup
+            cleanupIdleSessions()
+            }, "periodic timer")
+        }, checkIntervalMs)
+
+        if (timer.unref) timer.unref()
+
+        // Periodic session discovery
+        discoveryTimer = setInterval(() => {
+            safe(discoverSessions, "discoveryTimer").catch(() => {})
+        }, SESSION_DISCOVERY_INTERVAL_MS)
+        if (discoveryTimer.unref) discoveryTimer.unref()
+
+        // Run initial discovery after a short delay
+        setTimeout(discoverSessions, 5_000)
+    }
+
+    startTimer()
+
+    // -----------------------------------------------------------------------
+    // Event handler
+    // -----------------------------------------------------------------------
+
+    async function handleEvent(ev: Record<string, unknown>) {
+        const type = ev.type as string
+        const sid = getSid(ev)
+
+        // Only touch the session that emitted the event
+        if (sid) {
+            touchSession(sid)
+        }
+
+        switch (type) {
+            case "session.status": {
+                if (!sid) break
+                const statusType = getStatusType(ev)
+                const w = ensureWatch(sid)
+                w.status = statusType as SessionWatch["status"]
+
+                if (statusType === "busy") {
+                    w.lastActivityAt = Date.now()
+                    if (w.pendingRecovery) {
+                        dbg(`Pending recovery cleared on ${short(sid)}: reason=session-busy`)
+                    }
+                    resetBusyFlags(w)
+                    prevBusyCount = busyCount()
+                    log("debug", `${short(sid)} -> busy (${prevBusyCount})`)
+                } else if (statusType === "interrupted") {
+                    // User pressed Esc — clear timers, back off, let them write
+                    w.status = "idle"
+                    resetIdleFlags(w)
+                    w.userCancelled = true
+                    clearUsageLimit(w, sid, "interrupted by user")
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                    prevBusyCount = busyCount()
+                    log("info", `${short(sid)} -> interrupted by user, backing off`)
+                } else if (statusType === "idle") {
+                    w.status = "idle"
+                    resetIdleFlags(w)
+
+                    const currentBusy = busyCount()
+                    if (prevBusyCount > 1 && currentBusy === 1) {
+                        const lone = getLoneBusySession()
+                        if (lone && lone.w.orphanWatchStartAt === null) {
+                            lone.w.orphanWatchStartAt = Date.now()
+                            w.isSubagent = true
+                            log("info", `Subagent finished, parent ${short(lone.sid)} stuck. Orphan watch (${subagentWaitMs / 1000}s).`)
+                        }
+                    }
+                    prevBusyCount = currentBusy
+                    log("debug", `${short(sid)} -> idle (${currentBusy})`)
+
+                    if (!w.isSubagent) {
+                    if (
+                        !w.pendingRecovery &&
+                        !w.completionSignaled &&
+                        !w.userCancelled &&
+                        !w.aborting &&
+                        !w.usageLimit &&
+                        !w.usageLimitPending
+                    ) {
+                            try {
+                                const errInfo = getLastAssistantError(
+                                    await getSessionMessages(sid),
+                                )
+                                const usageLimitOutcome =
+                                    errInfo === null
+                                        ? "ignored"
+                                        : await handleUsageLimitSignal(
+                                              sid,
+                                              errInfo.name,
+                                              errInfo.message,
+                                              errInfo.id,
+                                          )
+                                if (
+                                    usageLimitOutcome === "ignored" &&
+                                    errInfo &&
+                                    isStreamingFailure(
+                                        errInfo.name,
+                                        errInfo.message,
+                                        streamingFailureErrorNames,
+                                        streamingFailureMessagePatterns,
+                                    )
+                                ) {
+                                    w.pendingRecovery = true
+                                    w.pendingRecoveryReason = errInfo.name
+                                    w.pendingRecoveryAt = Date.now()
+                                    dbg(
+                                        `State transition on ${short(sid)}: pendingRecovery=false -> true, reason=${errInfo.name}`,
+                                    )
+                                    await log(
+                                        "info",
+                                        `${short(sid)} - streaming failure detected on idle: ${errInfo.name} - ${errInfo.message}`,
+                                    )
+                                    await tryResume(
+                                        sid,
+                                        w,
+                                        "Streaming failure on idle",
+                                        continuePrompt,
+                                    )
+                                }
+                            } catch (e) {
+                                const errMsg =
+                                    e instanceof Error ? e.message : String(e)
+                                dbg(
+                                    `session.idle sid=${short(sid)}: streaming-failure check error: ${errMsg}`,
+                                )
+                            }
+
+                            // Silent dead stream: the newest assistant message has a
+                            // finish reason but no text parts (e.g. reasoning-only,
+                            // finish=unknown). A delivered text answer means the session
+                            // completed normally — no recovery.
+                            try {
+                                const dead = getLastSilentDeadStream(
+                                    await getSessionMessages(sid),
+                                )
+                                if (
+                                    dead &&
+                                    dead.outputTokens >= silentDeadStreamMinTokens
+                                ) {
+                                    let busyAgain = false
+                                    try {
+                                        const liveStatus = (await getSessionStatusMap())[sid]
+                                        busyAgain = liveStatus === "busy" || liveStatus === "retry"
+                                    } catch (e) {
+                                        dbg(
+                                            `session.idle sid=${short(sid)}: silent-dead-stream status check failed: ${e instanceof Error ? e.message : String(e)}`,
+                                        )
+                                    }
+                                    if (busyAgain) {
+                                        dbg(
+                                            `session.idle sid=${short(sid)}: silent-dead-stream recovery skipped, session is busy/retry again`,
+                                        )
+                                    } else {
+                                        w.pendingRecovery = true
+                                        w.pendingRecoveryReason = `silent-${dead.finish}`
+                                        w.pendingRecoveryAt = Date.now()
+                                        await log(
+                                            "info",
+                                            `${short(sid)} - silent dead stream: finish=${dead.finish}, ${dead.outputTokens} output tokens, no text parts; resuming`,
+                                        )
+                                        await tryResume(
+                                            sid,
+                                            w,
+                                            `Silent dead stream (${dead.finish})`,
+                                            continuePrompt,
+                                        )
+                                    }
+                                }
+                            } catch (e) {
+                                const errMsg =
+                                    e instanceof Error ? e.message : String(e)
+                                dbg(
+                                    `session.idle sid=${short(sid)}: silent-dead-stream check error: ${errMsg}`,
+                                )
+                            }
+                        }
+
+                        let todos = w.todos || []
+                        // Lazy fetch: if we never received a todo.updated event, try the API
+                        if (todos.length === 0) {
+                            const fetched = await fetchSessionTodos(sid)
+                            if (fetched.length > 0) {
+                                w.todos = fetched
+                                todos = fetched
+                            }
+                        }
+                        const open = getOpenTodos(todos)
+                        
+                        if (open.length > 0 && currentBusy === 0 && !w.completionSignaled && !w.userCancelled && w.todoNudgeAttempts < maxRetries) {
+                            if (!openTodosNudgeEnabled) {
+                                dbg(`session.idle sid=${short(sid)}: open-todos nudge disabled via openTodosNudge option`)
+                            } else if (await lastAssistantWaitsForUserInput(sid)) {
+                                await log("info", `${short(sid)} - skipping open-todos nudge: assistant appears to be waiting for user input`)
+                            } else {
+                                const isCelebration = await lastAssistantEndsWithCelebration(sid)
+                                await log("info", `${short(sid)} - open todos=${open.length}, isCelebration=${isCelebration}, currentBusy=${currentBusy}`)
+                                if (isCelebration) {
+                                    // 🎉 with open todos is a FALSE POSITIVE - don't latch completionSignaled, send nudge
+                                    await log("info", `${short(sid)} - 🎉 detected but ${open.length} open todos remain, sending nudge`)
+                                    const reminder = buildOpenTodosReminder(todos)
+                                    const sent = await tryResume(sid, w, "Idle with open todos (celebration false positive)", reminder)
+                                    if (sent) w.todoNudgeAttempts++
+                                } else {
+                                    const reminder = buildOpenTodosReminder(todos)
+                                    const sent = await tryResume(sid, w, "Idle with open todos", reminder)
+                                    if (sent) w.todoNudgeAttempts++
+                                }
+                            }
+                        }
+                    }
+
+                    if (!w.completionSignaled && !w.userCancelled && w.toolTextAttempts < maxRetries) {
+                        if (resumeOnActionIntent && !w.toolTextRecovered) {
+                            const idleSid = sid
+                            const idleW = w
+                            setTimeout(async () => {
+                                try {
+                                    if (Date.now() - idleW.createdAt < warmupMs) {
+                                        dbg(`session.idle sid=${short(idleSid)}: skipping action intent, session is warming up (${Date.now() - idleW.createdAt}ms < ${warmupMs}ms)`)
+                                        return
+                                    }
+                                    const msgs = await getSessionMessages(idleSid)
+                                    const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                                    if (lastAssistantMsg) {
+                                        let lastText = ""
+                                        for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                                            lastText += (part.text as string ?? "") + "\n"
+                                        }
+                                        if (containsActionIntent(lastText)) {
+                                            const w2 = sessions.get(idleSid)
+                                             if (!w2 || w2.toolTextRecovered || w2.completionSignaled || w2.userCancelled || w2.status !== "idle") return
+                                            w2.toolTextRecovered = true
+                                            w2.toolTextAttempts++
+                                            dbg(`session.idle sid=${short(idleSid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
+                                            await sendContinuePrompt(idleSid, actionIntentPrompt, w2)
+                                        }
+                                    }
+                                } catch (e) {
+                                    dbg(`session.idle sid=${short(idleSid)}: delayed check error: ${e}`)
+                                }
+                            }, 500)
+                        }
+
+                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+                        w.toolTextTimer = setTimeout(() => {
+                            checkForToolCallAsText(sid, w)
+                        }, toolTextCheckDelayMs)
+                    }
+                } else if (statusType === "retry") {
+                    touchSession(sid)
+                    log("debug", `${short(sid)} -> provider retry`)
+                }
+                break
+            }
+
+            case "session.created": {
+                if (!sid) break
+                const w = ensureWatch(sid)
+                w.pendingTools = 0
+                w.pendingCommands = 0
+                log("debug", `New session: ${short(sid)} (${sessions.size})`)
+                break
+            }
+
+            case "session.updated": {
+                if (sid) ensureWatch(sid)
+                break
+            }
+
+            case "session.idle": {
+                if (!sid) break
+                void snapshotBgResult(sid)
+                const w = sessions.get(sid)
+                if (w) {
+                    w.status = "idle"
+                    resetIdleFlags(w)
+                    dbg(`session.idle sid=${short(sid)}: resetIdleFlags done, toolTextRecovered=${w.toolTextRecovered}, toolTextAttempts=${w.toolTextAttempts}, maxRetries=${maxRetries}`)
+
+                    if (resumeOnActionIntent && !w.toolTextRecovered && !w.completionSignaled) {
+                        setTimeout(async () => {
+                            try {
+                                if (Date.now() - w.createdAt < warmupMs) {
+                                    dbg(`session.idle sid=${short(sid)}: skipping action intent, session is warming up (${Date.now() - w.createdAt}ms < ${warmupMs}ms)`)
+                                    return
+                                }
+                                const msgs = await getSessionMessages(sid)
+                                const lastAssistantMsg = msgs.slice().reverse().find(m => (m.role ?? (m.info as Record<string, unknown> | undefined)?.role) === "assistant")
+                                if (lastAssistantMsg) {
+                                    let lastText = ""
+                                    for (const part of ((lastAssistantMsg.parts as Array<Record<string, unknown>> | undefined) || [])) {
+                                        lastText += (part.text as string ?? "") + "\n"
+                                    }
+                                    if (containsActionIntent(lastText)) {
+                                        const w2 = sessions.get(sid)
+                                         if (!w2 || w2.toolTextRecovered || w2.completionSignaled || w2.userCancelled || w2.status !== "idle") return
+                                        w2.toolTextRecovered = true
+                                        w2.toolTextAttempts++
+                                        dbg(`session.idle sid=${short(sid)}: ACTION INTENT DETECTED, sending "${actionIntentPrompt.slice(0, 40)}..."`)
+                                        await sendContinuePrompt(sid, actionIntentPrompt, w2)
+                                    }
+                                }
+                            } catch (e) {
+                                dbg(`session.idle sid=${short(sid)}: delayed check error: ${e}`)
+                            }
+                        }, 500)
+                    }
+
+                    // Also check for tool-call-as-text on legacy idle event
+                    const shouldSet = !w.toolTextRecovered && w.toolTextAttempts < maxRetries
+                    if (shouldSet) {
+                        if (w.toolTextTimer) clearTimeout(w.toolTextTimer)
+                        w.toolTextTimer = setTimeout(() => {
+                            checkForToolCallAsText(sid, w)
+                        }, toolTextCheckDelayMs)
+                    }
+                }
+                break
+            }
+
+            case "session.interrupted": {
+                if (!sid) break
+                const w = sessions.get(sid)
+                if (w) {
+                    w.status = "idle"
+                    resetIdleFlags(w)
+                    w.userCancelled = true
+                    if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                    log("info", `${short(sid)} -> interrupted by user, backing off`)
+                }
+                break
+            }
+
+            case "todo.updated": {
+                if (!sid) break
+                const props = ev.properties as Record<string, unknown> | undefined
+                const rawTodos = props?.todos
+                const todos: Array<Record<string, unknown>> = Array.isArray(rawTodos) ? rawTodos : []
+
+                const w = ensureWatch(sid)
+                w.todos = todos.map((t) => ({
+                    content: (t?.content as string) ?? "",
+                    status: (t?.status as Todo["status"]) ?? "pending",
+                    priority: (t?.priority as Todo["priority"]) ?? "medium",
+                }))
+                break
+            }
+
+            case "session.error": {
+                const errorObj = getError(ev)
+                const errorName = (errorObj?.name as string) ?? ""
+                const errorMessage =
+                    (errorObj?.data as Record<string, unknown>)?.message as string | undefined ??
+                    String(errorObj?.data ?? "")
+                const isMessageAborted = errorName === "MessageAbortedError"
+
+                if (isMessageAborted) {
+                    for (const [wSid, w] of sessions) {
+                        if (!w.pluginAbortInFlight) {
+                            w.userCancelled = true
+                            w.status = "idle"
+                            resetIdleFlags(w)
+                            clearUsageLimit(w, wSid, "user abort")
+                        }
+                    }
+                    log("info", "User abort (ESC)")
+                    break
+                }
+
+                const isStreamingFail = isStreamingFailure(
+                    errorName,
+                    errorMessage,
+                    streamingFailureErrorNames,
+                    streamingFailureMessagePatterns,
+                )
+
+                const armStreamingFailure = async (): Promise<void> => {
+                    if (sid) {
+                        const w = sessions.get(sid)
+                        if (w && w.status === "busy") {
+                            w.pendingRecovery = true
+                            w.pendingRecoveryReason = errorName
+                            w.pendingRecoveryAt = Date.now()
+                            dbg(`State transition on ${short(sid)}: pendingRecovery=false -> true, reason=${errorName}`)
+                            await log("info", `Streaming failure detected on ${short(sid)}: errorName=${errorName}, errorMessage=${errorMessage}, pendingRecoveryReason=${errorName}`)
+                        }
+                        log("info", `Streaming failure detected: ${errorName} - ${errorMessage}`)
+                    } else {
+                        log("warn", `Streaming failure detected but no session ID: ${errorName} - ${errorMessage}`)
+                    }
+                }
+
+                if (isUsageLimitSignal(errorName, errorMessage)) {
+                    // Probing the usage endpoint is async; the synchronous
+                    // pendingRecovery bookkeeping below must not be delayed,
+                    // otherwise racing status events reorder the recovery.
+                    void (async () => {
+                        const outcome = await handleUsageLimitSignal(sid ?? "", errorName, errorMessage)
+                        if (outcome === "ignored" && isStreamingFail) await armStreamingFailure()
+                    })()
+                } else if (isStreamingFail) {
+                    await armStreamingFailure()
+                }
+
+                if (busyCount() === 0) break
+
+                log("debug", `Session error: ${errorName} - ${errorMessage}`)
+
+                if (sid) {
+                    const w = sessions.get(sid)
+                    if (w) { w.pendingTools = 0; w.pendingCommands = 0 }
+                }
+                break
+            }
+
+            case "command.executed": {
+                if (!sid) break
+                const w = sessions.get(sid)
+                if (w) {
+                    if (w.pendingRecovery) {
+                        dbg(`Pending recovery cleared on ${short(sid)}: reason=user-command`)
+                    }
+                    resetBusyFlags(w)
+                    w.pendingCommands = Math.max(0, w.pendingCommands - 1)
+                    w.lastActivityAt = Date.now()
+                }
+                break
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // task_complete tool
+    // -----------------------------------------------------------------------
+
+    const taskCompleteTool = tool({
+        description: "Signal that all work is complete and stop automatic continuation prompts. Call this ONLY after finishing everything requested.",
+        args: {},
+        execute: async (_args, ctx) => {
+            const w = sessions.get(ctx.sessionID)
+            if (w) {
+                if (!w.isSubagent) {
+                    const openTodos = (w.todos || []).filter(t => t.status === "pending" || t.status === "in_progress")
+
+                    if (openTodos.length > 0 && w.taskCompleteOverrides < maxRetries) {
+                        w.taskCompleteOverrides++
+                        await log("info", `${short(ctx.sessionID)} - task_complete blocked: ${openTodos.length} open todos remain (override ${w.taskCompleteOverrides}/${maxRetries})`)
+                        return `You have ${openTodos.length} unfinished task(s). Please complete all remaining work before signaling completion.`
+                    }
+                }
+
+                w.toolTextRecovered = true
+                w.completionSignaled = true
+                if (w.toolTextTimer) { clearTimeout(w.toolTextTimer); w.toolTextTimer = null }
+                log("info", `${short(ctx.sessionID)} - task_complete called, ${w.isSubagent ? 'subagent' : 'agent'} done`)
+            }
+            return "Task completion acknowledged. No further continuation will be sent."
+        },
+    })
+
+    // -----------------------------------------------------------------------
+    // Returned hooks
+    // -----------------------------------------------------------------------
+
+    return {
+        event: async ({ event }) => {
+            if (!initialised) {
+                initialised = true
+                log("info", `opencode-auto-resume ready. timeout=${chunkTimeoutMs}ms, orphan=${subagentWaitMs}ms, loop=${loopMaxContinues}x/${loopWindowMs / 1000}s`)
+            }
+            handleEvent(event as Record<string, unknown>).catch((e) => {
+                const msg = e instanceof Error ? e.message : String(e)
+                console.error(`[auto-resume] handleEvent error: ${msg}`)
+                log("error", `handleEvent error: ${msg}`).catch(() => {})
+            })
+        },
+
+        config: async () => {
+            log("info", `opencode-auto-resume config OK`)
+        },
+        tool: {
+            "task_complete": taskCompleteTool,
+        },
+
+        "chat.message": async (input) => {
+            const sid = input?.sessionID
+            if (!sid) return
+            const w = ensureWatch(sid)
+            w.lastActivityAt = Date.now()
+            // Recovery prompts this plugin sends via session.prompt() also land
+            // here, but only while `continuing` is latched (sendContinuePrompt
+            // holds it across the await). A message arriving with `continuing`
+            // unset is a genuine user (or external client) prompt: a new round
+            // of work, so lift the ESC back-off and the task_complete latch.
+            // Busy-state resets must still preserve both flags (issue #16).
+            if (w.continuing) return
+            if (w.userCancelled || w.completionSignaled) {
+                w.userCancelled = false
+                w.completionSignaled = false
+                await log("info", `${short(sid)} - new user message, re-arming auto-resume`)
+            }
+        },
+
+        "tool.execute.before": async (input, output) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingTools++
+            w.lastActivityAt = Date.now()
+            if (
+                staleTaskGuardEnabled &&
+                input.tool === "task" &&
+                output?.args &&
+                typeof output.args === "object"
+            ) {
+                await guardStaleTaskId(input.sessionID, output.args as Record<string, unknown>)
+            }
+        },
+
+        "command.execute.before": async (input) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingCommands++
+            w.lastActivityAt = Date.now()
+        },
+
+        "tool.execute.after": async (input) => {
+            if (!input?.sessionID) return
+            const w = ensureWatch(input.sessionID)
+            w.pendingTools = Math.max(0, w.pendingTools - 1)
+            w.lastActivityAt = Date.now()
+        },
+    }
+}
+
+export default AutoResumePlugin

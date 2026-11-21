@@ -1,0 +1,10 @@
+{
+  "usageLimitProviders": ["lanit"],
+  "usageLimitScript": "/Users/sergejtincurin/.local/share/opencode-v2-migration/stage/auto-resume/probe/fake-limits-unknown.sh",
+  "usageLimitRecheckMs": 1500,
+  "usageLimitMaxRechecks": 1,
+  "chunkTimeoutMs": 600000,
+  "checkIntervalMs": 1000,
+  "logFile": "/Users/sergejtincurin/.local/share/opencode-v2-migration/tmp/auto-resume.log",
+  "debug": true
+}
