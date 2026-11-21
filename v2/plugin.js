@@ -668,8 +668,25 @@ function createPlugin(ctx) {
 
     function acquireClaim(s, reason) {
         if (!claimDir) return true
-        if (s.claimPath) return true
         const file = path.join(claimDir, `${s.sid}.json`)
+        if (s.claimPath) {
+            // A held claim must not bypass the freshness check: with no
+            // activity (a pending question suspends the turn, so nothing
+            // touches the session) the on-disk claim ages past the TTL while
+            // claimPath is still set. Another instance then takes over the
+            // stale claim at the same moment and both deliver (2026-11-21:
+            // two "continue" messages within the same millisecond). Re-check
+            // the file; if it aged out, fall through and re-claim atomically.
+            if (s.claimPath !== file) return true
+            let heldAt = 0
+            try {
+                heldAt = JSON.parse(fs.readFileSync(file, 'utf8'))?.at ?? 0
+            } catch {
+                heldAt = 0
+            }
+            if (Date.now() - heldAt < claimTtlMs) return true
+            s.claimPath = null
+        }
         try {
             fs.mkdirSync(claimDir, { recursive: true })
             fs.writeFileSync(file, JSON.stringify({ at: Date.now(), reason }), { flag: 'wx' })
@@ -686,7 +703,11 @@ function createPlugin(ctx) {
             }
             if (Date.now() - at < claimTtlMs) return false
             try {
-                fs.writeFileSync(file, JSON.stringify({ at: Date.now(), reason }))
+                // Unlink-then-create keeps a stale takeover atomic: when two
+                // instances race, exactly one wins the `wx` create and the
+                // loser sees a fresh claim.
+                fs.unlinkSync(file)
+                fs.writeFileSync(file, JSON.stringify({ at: Date.now(), reason }), { flag: 'wx' })
             } catch {
                 return false
             }
@@ -827,7 +848,17 @@ function createPlugin(ctx) {
         deafEpisodeAt = 0
         const type = env?.type
         const data = asObject(env?.data)
-        const sid = typeof data.sessionID === 'string' ? data.sessionID : null
+        // opencode 2.3.2 nests the session under `data.form` on form.created
+        // (data: { form: { sessionID, ... } }); form.replied/form.cancelled
+        // carry a top-level sessionID. The nested path is load-bearing: the
+        // event bus is the only channel that reaches EVERY plugin instance,
+        // so a form.created skipped here leaves other processes' watchdogs
+        // free to nudge a session that is waiting for its user to answer
+        // (2026-11-21: unsolicited "continue" into an open Questions dialog).
+        const sid =
+            [data.sessionID, data.form?.sessionID].find(
+                (value) => typeof value === 'string' && value,
+            ) ?? null
         if (!sid) return
         const s = ensureWatch(sid)
         if (type === 'session.created') {

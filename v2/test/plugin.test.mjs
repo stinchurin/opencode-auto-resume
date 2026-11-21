@@ -365,6 +365,33 @@ describe('pending question guard', () => {
         expect(resumed).toBe(true)
     })
 
+    test('regression 2026-11-21: real form.created envelope (sessionID nested in data.form) blocks the stall resume', async () => {
+        // opencode 2.3.2 emits `data: { form: { sessionID, ... } }` for
+        // form.created — there is no top-level data.sessionID. An instance
+        // that only sees the event bus (any opencode process except the one
+        // executing the session) must still raise questionPending, or its
+        // stall watchdog sends "continue" while the user is choosing.
+        await start({ ...stallOptions })
+        host.emit('session.execution.started', { sessionID: 'ses_test' })
+        host.emit('form.created', {
+            form: {
+                id: 'frm_test',
+                sessionID: 'ses_test',
+                title: 'Questions',
+                metadata: { kind: 'question' },
+            },
+        })
+        await waitFor(() => instance.sessions.get('ses_test')?.questionPending === true, {
+            timeoutMs: 1500,
+        })
+        await new Promise((resolve) => setTimeout(resolve, 400))
+        expect(host.state.prompts.length).toBe(0)
+        host.emit('form.replied', { id: 'frm_test', sessionID: 'ses_test' })
+        const resumed = await waitFor(() => host.state.prompts.length === 1, { timeoutMs: 1500 })
+        expect(resumed).toBe(true)
+        expect(host.state.prompts[0].metadata.reason).toBe('stall')
+    })
+
     test('a fresh execution clears a stale pending question', async () => {
         await start({ ...stallOptions })
         host.emit('session.execution.started', { sessionID: 'ses_test' })
@@ -436,6 +463,39 @@ describe('cross-instance claim', () => {
         expect(fs.existsSync(claimFile)).toBe(true)
         const claim = JSON.parse(fs.readFileSync(claimFile, 'utf8'))
         expect(Date.now() - claim.at).toBeLessThan(5000)
+    })
+
+    test('regression 2026-11-21: a holder of an aged claim re-claims atomically instead of bypassing freshness', async () => {
+        // The first delivery leaves claimPath set. With no activity (e.g. a
+        // pending question suspends the turn), the claim file ages past the
+        // TTL. On the next stall pass the holder must not blindly return
+        // true: a second instance takes over the stale claim at the same
+        // moment, and both delivered "continue" within the same millisecond.
+        const claimDir = path.join(TMP, `claims-${Math.random().toString(36).slice(2)}`)
+        await start(claimOptions(claimDir))
+        host.emit('session.execution.started', { sessionID: 'ses_test' })
+        const first = await waitFor(() => host.state.prompts.length === 1, { timeoutMs: 2000 })
+        expect(first).toBe(true)
+        // Simulate the claim aging out with no activity in between.
+        const claimFile = path.join(claimDir, 'ses_test.json')
+        const aged = JSON.parse(fs.readFileSync(claimFile, 'utf8'))
+        aged.at -= 10 * 60_000
+        fs.writeFileSync(claimFile, JSON.stringify(aged))
+        const claim = JSON.parse(fs.readFileSync(claimFile, 'utf8'))
+        expect(Date.now() - claim.at).toBeGreaterThan(60_000)
+        // A second stall pass (backoff clears in ~20ms) must re-claim: the
+        // holder may not bypass the freshness check, so the on-disk claim is
+        // either refreshed or the delivery blocked by a fresher claim — the
+        // stale file must not survive either way.
+        host.emit('session.execution.started', { sessionID: 'ses_test' })
+        const reclaimed = await waitFor(() => {
+            try {
+                return Date.now() - JSON.parse(fs.readFileSync(claimFile, 'utf8')).at < 60_000
+            } catch {
+                return false
+            }
+        }, { timeoutMs: 2000 })
+        expect(reclaimed).toBe(true)
     })
 })
 
